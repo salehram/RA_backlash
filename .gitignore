@@ -86,3 +86,4 @@ Thumbs.db
 Desktop.ini
 *.swp
 *~
+!docs/images/*.png
