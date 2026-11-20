@@ -34,6 +34,9 @@ There is no standalone executable/installer yet. The initial window is **disconn
 
 ## Try the desktop simulator first
 
+New to the app? See the illustrated [quick start guide](docs/USER_GUIDE.md).
+
+
 1. Select **Connect camera & mount… (or Simulation)**, leave **Simulation — no hardware** checked, and connect. Nothing moves and no picture is taken yet.
 2. Click **1 · Take picture** (or **Live view**) to see the stars. Then click **2 · Pick star automatically** or click an isolated star in the camera picture. Stop Live view before measuring.
 3. Click **3 · Measure backlash** and accept the confirmation (it states how long the run takes; about a minute and a half per angle on a real mount, seconds in the simulator). Each run re-finds the star and recalibrates. The coloured **result box** near the top then shows the value and a verdict.
