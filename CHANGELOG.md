@@ -1,5 +1,12 @@
 # Change log
 
+## Result interpretation update
+
+- Added a scrollable **Result & next action** tab with evidence-based interpretation, quality reasons, diagnostics, map comparisons and explicit next steps.
+- Distinguish measurable, unresolved, unreliable and inconclusive results without calling an unresolved gap zero or diagnosing binding.
+- Optional disabled-by-default user target compares the complete diagnostic envelope against a selected maximum; no universal safe mesh gap or EQ6-R tolerance is assumed. Target changes are display-only and do not authorize motion.
+- Standalone completion opens the assessment; table-row selection and offline imports expose the same interpretation without changing saved evidence or hardware interlocks.
+
 ## Desktop clarity update
 
 - Persistent next-step instructions after connection, star selection, measurement, Stop and faults; distinguish a single-point measurement from an angle map.

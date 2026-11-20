@@ -957,6 +957,8 @@ def test_real_simulator_signals_complete_then_preview_without_reverting(window, 
         until(app, lambda: len(ready) == 2, 60)
         assert ready[-1] == "completed"
         assert phases[0] == "drift"
+        assert window.tabs.currentWidget() is window.assessment_panel
+        assert "educational synthetic" in window.assessment_details.toPlainText()
         assert f"B = {results[-1]['backlash']:.3f}" in window.result_summary.text()
         assert len(legend_names(window.time_plot)) == 5
         data = [a.copy() for a in window.x_curve.getData()]
@@ -970,3 +972,160 @@ def test_real_simulator_signals_complete_then_preview_without_reverting(window, 
         window.worker.shutdown()
         assert window.worker.wait(10000)
         app.processEvents()
+
+
+def test_result_tab_is_first_readable_and_does_not_replace_trajectory(window):
+    assert window.tabs.widget(0) is window.assessment_panel
+    assert window.tabs.tabText(0) == "Result & next action"
+    assert window.assessment_details.isReadOnly()
+    assert window.assessment_panel.widgetResizable()
+    assert not window.target_check.isChecked()
+    assert not window.target_spin.isEnabled()
+    window._on_result(dict(completed_display_result(), quality="valid"))
+    assert window.assessment_title.text() == "Measurable backlash — size target not set"
+    assert "Start map" in window.assessment_action.text()
+    assert "cannot detect binding" in window.assessment_warning.text()
+    assert "12.000 ± 1.500" in window.result_summary.text()
+    assert window.fit_items  # Existing trajectory remains intact.
+
+
+def test_comparison_goal_is_display_only_reassesses_without_rerun(window, monkeypatch):
+    calls = []
+    monkeypatch.setattr(window.worker, "submit", lambda *a, **k: calls.append((a, k)))
+    r = dict(completed_display_result(), quality="valid")
+    window._on_result(r)
+    old_config = window._config()
+    old_fits = list(window.fit_items)
+    window.target_spin.setValue(20.)
+    assert "size target not set" in window.assessment_title.text()
+    window.target_check.setChecked(True)
+    assert window.target_spin.isEnabled()
+    assert "Within selected target" in window.assessment_title.text()
+    window.target_spin.setValue(5.)
+    assert "Above selected target" in window.assessment_title.text()
+    window.target_spin.setValue(12.)
+    assert "overlaps target" in window.assessment_title.text()
+    window.target_check.setChecked(False)
+    assert "size target not set" in window.assessment_title.text()
+    assert not calls and window._config() == old_config
+    assert window.last_result is r and window.fit_items == old_fits
+    assert not any("target" in key for key in window.settings.allKeys())
+
+
+def test_goals_stay_only_in_this_window(window, app):
+    window.target_spin.setValue(20.)
+    window.target_check.setChecked(True)
+    other = MainWindow(start_worker=False, settings=window.settings)
+    try:
+        assert not other.target_check.isChecked()
+        assert not other.target_spin.isEnabled()
+    finally:
+        other.close()
+
+
+def test_actual_drift_clears_interpretation_and_target_changes_do_not_revive_it(window):
+    window._on_result(dict(completed_display_result(), quality="valid"))
+    window.target_check.setChecked(True)
+    phase_event(window, "drift")
+    window.target_spin.setValue(100.)
+    assert window.last_result is None and window._assessment_result is None
+    assert window.assessment_title.text() == "No completed result selected"
+    assert not window.assessment_details.toPlainText()
+    assert "cannot detect binding" in window.assessment_warning.text()
+    assert window.target_check.isChecked()  # The user's window-local goal survives.
+
+
+@pytest.mark.parametrize("workflow", ["measure", "map", "slew_candidate"])
+def test_only_completed_standalone_measure_selects_results(window, monkeypatch, workflow):
+    monkeypatch.setattr(window.worker, "submit", lambda *a, **k: True)
+    window._launch(workflow)
+    window.tabs.setCurrentWidget(window.map_panel)
+    window._on_result(completed_display_result())
+    assert window.tabs.currentWidget() is window.map_panel  # No point signal steals focus.
+    window._on_ready("completed")
+    expected = window.assessment_panel if workflow == "measure" else window.map_panel
+    assert window.tabs.currentWidget() is expected
+    window.tabs.setCurrentWidget(window.trajectory_panel)
+    window._on_ready("completed")
+    assert window.tabs.currentWidget() is window.trajectory_panel  # No stale workflow.
+
+
+def test_failed_measure_does_not_automatically_select_result(window, monkeypatch):
+    monkeypatch.setattr(window.worker, "submit", lambda *a, **k: True)
+    window._launch("measure")
+    window._on_result(dict(status="cancelled", quality="invalid", backlash=None))
+    window._on_ready("fault")
+    assert window.tabs.currentWidget() is window.trajectory_panel
+    assert "Measurement unreliable" in window.assessment_title.text()
+
+
+def test_row_selection_interprets_without_camera_reconstruction_or_authorization(window, monkeypatch):
+    calls = []
+    monkeypatch.setattr(window.worker, "submit", lambda *a, **k: calls.append(a))
+    original = dict(completed_display_result(), quality="valid")
+    window._on_result(original)
+    fits = list(window.fit_items)
+    window._on_frame(preview_snapshot())
+    image = window.image_item.image.copy()
+    window.connected = window.can_slew = True
+    window.current_connection = "live"
+    window._on_ready("idle")
+    window._on_rows([
+        dict(angle=25., backlash=12., quality="valid", uncertainty_arcsec=1., imported=True),
+        dict(angle=50., backlash=30., quality="valid", uncertainty_arcsec=1., imported=True)])
+    window.table.selectRow(1)
+    window.target_spin.setValue(20.)
+    window.target_check.setChecked(True)
+    assert "Above selected target" in window.assessment_title.text()
+    assert "B: 30" in window.assessment_details.toPlainText()
+    assert "source not recorded" in window.assessment_details.toPlainText()
+    assert window.last_result is original and window.fit_items == fits
+    np.testing.assert_array_equal(window.image_item.image, image)
+    assert not window.candidate_button.isEnabled() and not calls
+    assert "Lowest measured gap" in window.map_assessment_label.text()
+    window.table.selectRow(0)
+    assert "Within selected target" in window.assessment_title.text()
+
+
+@pytest.mark.parametrize("simulation", [None, False, True])
+def test_import_interprets_row_zero_offline_not_current_simulator(window, tmp_path, monkeypatch, simulation):
+    r = dict(backlash=12., uncertainty_arcsec=1., quality="valid", angle=25.)
+    if simulation is not None:
+        r["simulation"] = simulation
+    path = tmp_path / "saved.json"
+    path.write_text(json.dumps(r), encoding="utf-8")
+    monkeypatch.setattr(QtWidgets.QFileDialog, "getOpenFileName", lambda *a, **k: (str(path), ""))
+    window.connected = window.simulation = True
+    window._import(False)
+    assert window.table.currentRow() == 0
+    assert window.tabs.currentWidget() is window.assessment_panel
+    assert "Measurable backlash" in window.assessment_title.text()
+    expected = {None: "source not recorded", False: "Recorded hardware measurement", True: "educational synthetic"}
+    assert expected[simulation] in window.assessment_details.toPlainText()
+    assert window.last_result is None  # Import/selection is not a camera result.
+    assert window.image_item.image is None
+    assert not window.candidate_button.isEnabled()
+
+
+def test_import_legacy_missing_uncertainty_is_unreliable_even_disconnected(window, tmp_path, monkeypatch):
+    path = tmp_path / "legacy.json"
+    path.write_text('{"backlash":12,"spread":0.1}', encoding="utf-8")
+    monkeypatch.setattr(QtWidgets.QFileDialog, "getOpenFileName", lambda *a, **k: (str(path), ""))
+    window._import(False)
+    assert window.state == "disconnected"
+    assert "Measurement unreliable" in window.assessment_title.text()
+
+
+def test_live_connection_context_only_and_map_summary_does_not_overrule_point(window):
+    window.connected = True
+    window.simulation = False
+    window.current_connection = "live"
+    window._on_result(dict(completed_display_result(), connection="live"))
+    assert "Recorded hardware measurement" in window.assessment_details.toPlainText()
+    window._on_rows([dict(angle=25., backlash=12., uncertainty_arcsec=1., quality="valid",
+                          simulation=True)])
+    assert "No tight spot across the axis" in window.map_assessment_label.text()
+    assert "educational synthetic" in window.map_assessment_label.text()
+    assert "Inconclusive" in window.assessment_title.text()
+    window._on_result(dict(completed_display_result(), connection="old"))
+    assert "source not recorded" in window.assessment_details.toPlainText()

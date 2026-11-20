@@ -74,6 +74,24 @@ In **adjustment**, automatic measurement/preview/map motion is interlocked and t
 
 ## Interpret results
 
+After **Measure here**, open **Result & next action** (it opens automatically on completion). It explains the measurement and recommends a next step, independently of the plots:
+
+| Assessment | Meaning / next step |
+| --- | --- |
+| **Measurable backlash — size target not set** | Positive lost motion is resolved above the diagnostic allowance. Repeat at the same pose, then map several angles before considering mesh tuning. It is not automatically “too loose.” |
+| **Not resolved above measurement uncertainty** | The estimate is no greater than its diagnostic allowance. This is **not a measured zero**, and does not prove binding. Improve measurement conditions and repeat; do not keep tightening to chase zero. |
+| **Inconclusive / measurement unreliable** | Noise, correlation, missing calibration, loss, interrupted acquisition or other quality failures prevent a size/mesh conclusion. Address the quality reasons first. |
+| **Above / within selected target** | Optional comparison against **your** maximum acceptable RA-axis backlash, not a manufacturer tolerance or safe physical mesh gap. Only qualified measurements are compared, and the complete diagnostic envelope must be on the relevant side. |
+| **Diagnostic envelope overlaps target** | The evidence cannot distinguish above versus within your goal; repeat rather than assuming a pass/fail. |
+
+The optional target is disabled by default, applies only to interpretation, stays local to the current window and is not saved with measurements. Enabling or changing it does not change the estimator, start a measurement, authorize motion or establish a safe adjustment. No universal EQ6-R backlash limit is assumed.
+
+For example, **13.3 ± 3.3 RA-axis arcsec** represents an inferred gap with a diagnostic envelope of approximately **10.0–16.6 arcsec** (not a calibrated confidence interval). With a valid run it is measurable; a selected target of 5 arcsec would be below the whole envelope, 20 arcsec above it, and 12 arcsec inside it. These are comparison examples, **not recommended settings**. At a 2× sidereal measurement rate, the nominal reversal take-up model gives about **0.44 s**, excluding command latency; this is not a prediction of guiding performance.
+
+Select any measured/imported table row to read its assessment. The map summary compares qualified sampled angles, flags overlapping envelopes and excludes unqualified rows. One point cannot establish the axis's tightest location. Simulation results are educational synthetic data, not evidence about the real mount.
+
+**Binding cannot be diagnosed from this measurement alone.** Small measured backlash, unresolved backlash, balance/preload, friction and inadequate measurement sensitivity can produce similar results. If the mount shows abnormal resistance, stalls or other concerning behaviour, stop testing and investigate using the manufacturer's procedure or a qualified service provider; do not force motion or tighten based only on this number. The tool does not sense motor torque/current or certify binding-free operation.
+
 Results are **RA-axis arcseconds**, not on-sky arcseconds. Tracking-off drift calibrates camera direction and scale; same-direction steps estimate latency separately from reversal dead time. Three cycles normally produce **six measurement reversals**; calibration transitions are excluded in the new engine. This intentionally differs from legacy runs that can aggregate seven transitions.
 
 `valid`, `uncertain` and `invalid` are algorithmic quality classifications, not certification. Missing latency/calibration, inadequate fits, loss of identity, negative signed estimates and unresolved near-zero results are not silently promoted to tight spots. Residual noise and reversal spread are separate from `uncertainty_arcsec`: the latter is a **conservative diagnostic allowance, not a calibrated confidence interval or a promised coverage probability**. Strong measured baseline correlation (lag-1 > 0.5) makes results uncertain and candidate-ineligible pending validated correlation-aware uncertainty. Temporal-correlation and calibration diagnostics do not remove atmospheric/systematic motion. No guaranteed accuracy, seeing subtraction or precise-zero claim is made; ensemble/Monte Carlo coverage validation and bounded adaptive extra cycles remain backlog.

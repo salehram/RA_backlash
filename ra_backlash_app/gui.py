@@ -26,6 +26,7 @@ import pyqtgraph as pg
 from PySide6 import QtCore, QtWidgets
 
 from . import core, devices
+from .assessment import assess_map, assess_result
 
 
 IDLE_STATES = {"idle", "completed"}
@@ -749,6 +750,8 @@ class MainWindow(QtWidgets.QMainWindow):
         self.rows = []
         self.baseline = []
         self.last_result = None
+        self._assessment_result = None
+        self._display_workflow = None
         self.trail = deque(maxlen=2000)
         self.samples = deque(maxlen=12000)
         self.calibration = None
@@ -906,6 +909,51 @@ class MainWindow(QtWidgets.QMainWindow):
         image_layout.addWidget(self.quality_label)
         center.addWidget(image_panel)
         self.tabs = tabs = QtWidgets.QTabWidget()
+        self.assessment_panel = QtWidgets.QScrollArea()
+        self.assessment_panel.setWidgetResizable(True)
+        assessment_body = QtWidgets.QWidget()
+        assessment_layout = QtWidgets.QVBoxLayout(assessment_body)
+        self.assessment_panel.setWidget(assessment_body)
+        self.assessment_title = QtWidgets.QLabel()
+        self.assessment_title.setObjectName("title")
+        self.assessment_meaning = QtWidgets.QLabel()
+        self.assessment_action = QtWidgets.QLabel()
+        self.assessment_warning = QtWidgets.QLabel()
+        for label in (self.assessment_title, self.assessment_meaning,
+                      self.assessment_action, self.assessment_warning):
+            label.setWordWrap(True)
+            label.setTextFormat(QtCore.Qt.TextFormat.PlainText)
+            label.setTextInteractionFlags(QtCore.Qt.TextInteractionFlag.TextSelectableByMouse)
+            assessment_layout.addWidget(label)
+        goal_form = QtWidgets.QFormLayout()
+        self.target_check = QtWidgets.QCheckBox("Maximum acceptable backlash (RA-axis arcsec)")
+        self.target_spin = QtWidgets.QDoubleSpinBox()
+        self.target_spin.setDecimals(3)
+        self.target_spin.setRange(0., 1_000_000.)
+        self.target_spin.setEnabled(False)
+        goal_form.addRow(self.target_check, self.target_spin)
+        assessment_layout.addLayout(goal_form)
+        goal_note = QtWidgets.QLabel(
+            "Optional selected comparison goal only — not a manufacturer tolerance or safe mesh gap. "
+            "Off by default; kept only in this window. Interpretation only, not saved with results. "
+            "Changes do not rerun measurement or command hardware.")
+        goal_note.setWordWrap(True)
+        assessment_layout.addWidget(goal_note)
+        self.assessment_details = QtWidgets.QPlainTextEdit()
+        self.assessment_details.setReadOnly(True)
+        self.assessment_details.setMinimumHeight(155)
+        assessment_layout.addWidget(self.assessment_details)
+        self.map_assessment_label = QtWidgets.QLabel()
+        self.map_assessment_label.setWordWrap(True)
+        self.map_assessment_label.setTextFormat(QtCore.Qt.TextFormat.PlainText)
+        self.map_assessment_label.setTextInteractionFlags(QtCore.Qt.TextInteractionFlag.TextSelectableByMouse)
+        empty_map = assess_map([])
+        self.map_assessment_label.setText("Map summary (separate from selected point)\n" +
+            "\n".join([empty_map["title"], empty_map["meaning"], empty_map["action"]]))
+        assessment_layout.addWidget(self.map_assessment_label)
+        self.target_check.toggled.connect(self._reassess)
+        self.target_spin.valueChanged.connect(self._reassess)
+        tabs.addTab(self.assessment_panel, "Result & next action")
         self.time_plot = pg.PlotWidget(title="Raw sensor coordinates vs time · calibration required for RA projection")
         self.time_plot.setMinimumHeight(220)
         self.time_plot.addLegend(colCount=2, brush=pg.mkBrush("#172633"),
@@ -955,6 +1003,7 @@ class MainWindow(QtWidgets.QMainWindow):
         self.table.horizontalHeader().setSectionResizeMode(QtWidgets.QHeaderView.ResizeMode.ResizeToContents)
         self.table.horizontalHeader().setStretchLastSection(True)
         self.table.itemSelectionChanged.connect(self._gate)
+        self.table.itemSelectionChanged.connect(self._assess_selection)
         tabs.addTab(self.table, "Plan & measurements")
         center.addWidget(tabs)
         center.setSizes([340, 370])
@@ -1027,6 +1076,7 @@ class MainWindow(QtWidgets.QMainWindow):
                 payload.setdefault("cfg", self._config())
             accepted = self.worker.submit(name, **payload)
             if accepted and name in {"measure", "slew_candidate", "map"}:
+                self._display_workflow = name
                 self.tabs.setCurrentWidget(self.map_panel if name == "map" else self.trajectory_panel)
             if accepted and self.connected and name not in {"connect", "skip", "pose"}:
                 self._save_profile()
@@ -1175,7 +1225,7 @@ class MainWindow(QtWidgets.QMainWindow):
                 "calibrating": "Calibrating camera direction and drive response; wait or Stop.",
                 "measuring": "Measuring RA reversals; wait for the fitted result or Stop.",
                 "analyzing": "Fitting the recorded trajectory and checking measurement quality.",
-                "completed": "Completed — inspect B ± diagnostic allowance and quality reasons in Trajectory; map points appear in Map & baseline.",
+                "completed": "Completed — inspect Result & next action for interpretation of B ± diagnostic allowance; Trajectory shows fits, Map & baseline shows sampled points.",
                 "fault": "Fault — use native controls if needed. Inspect the log, disconnect, then reconnect before retrying.",
                 "adjustment": "Adjustment interlock — RA stopped / tracking OFF reported. Clear hands/tools before Finish adjustment; reacquire for a new measurement.",
                 "stopping": "Stopping — waiting for cooperative cleanup, not returning the mount. Use native controls if a driver hangs.",
@@ -1195,6 +1245,8 @@ class MainWindow(QtWidgets.QMainWindow):
         self.trail.clear()
         self.calibration = None
         self.last_result = None
+        self._assessment_result = None
+        self._reassess()
         self._pending_phase = False
         self._has_commands = self._has_fits = False
         for item in self.fit_items:
@@ -1282,6 +1334,41 @@ class MainWindow(QtWidgets.QMainWindow):
     def _on_ready(self, state):
         self.pending = False
         self._on_state(state)
+        if state == "completed" and self._display_workflow == "measure" and self.last_result is not None:
+            self.tabs.setCurrentWidget(self.assessment_panel)
+        self._display_workflow = None
+
+    def _assessment_source(self, result):
+        """Use known connection context only for live data, never for offline imports."""
+        source = dict(result)
+        if ("simulation" not in source and not source.get("imported") and self.connected
+                and (source.get("connection") is None or source.get("connection") == self.current_connection)):
+            source["simulation"] = self.simulation
+        return source
+
+    def _reassess(self, *_):
+        self.target_spin.setEnabled(self.target_check.isChecked())
+        if self._assessment_result is None:
+            self.assessment_title.setText("No completed result selected")
+            self.assessment_meaning.setText("Measure here for one point, or select a saved/measured table row to interpret its evidence.")
+            self.assessment_action.setText("Next action: repeatable measurements first; Start map before mesh tuning.")
+            self.assessment_warning.setText(assess_result(None)["binding_warning"])
+            self.assessment_details.clear()
+            return
+        target = self.target_spin.value() if self.target_check.isChecked() else None
+        assessment = assess_result(self._assessment_result, target)
+        self.assessment_title.setText(assessment["title"])
+        self.assessment_title.setProperty("tone", assessment["tone"])
+        self.assessment_meaning.setText(assessment["meaning"])
+        self.assessment_action.setText("Next action: " + assessment["action"])
+        self.assessment_warning.setText(assessment["binding_warning"])
+        self.assessment_details.setPlainText("\n".join(assessment["details"]))
+
+    def _assess_selection(self):
+        index = self.table.currentRow()
+        if 0 <= index < len(self.rows):
+            self._assessment_result = self._assessment_source(self.rows[index])
+            self._reassess()
 
     def _gate(self):
         idle = self.connected and self.state in IDLE_STATES and not self.pending and not self.closing
@@ -1466,6 +1553,8 @@ class MainWindow(QtWidgets.QMainWindow):
     @QtCore.Slot(object)
     def _on_result(self, result):
         self.last_result = result
+        self._assessment_result = self._assessment_source(result)
+        self._reassess()
         summary = (f"B = {finite(result.get('backlash')):.3f} ± {finite(result.get('uncertainty_arcsec')):.3f} "
                    f"RA-axis arcsec (diagnostic allowance, NOT a calibrated confidence interval) · "
                    f"Quality: {result.get('quality', 'unknown')}")
@@ -1531,7 +1620,7 @@ class MainWindow(QtWidgets.QMainWindow):
             self.trail_item.setData(positions[:, 0], positions[:, 1], connect="finite")
             self._fit_image()
         self._update_trajectory()
-        self._update_guidance("Result available — inspect B ± diagnostic allowance and quality reasons in Trajectory. "
+        self._update_guidance("Result available — inspect Result & next action for interpretation and Trajectory for fits. "
                               "Measure here is one point; Start map measures multiple angles.")
         for note in notes:
             self._log(note)
@@ -1539,6 +1628,7 @@ class MainWindow(QtWidgets.QMainWindow):
     @QtCore.Slot(object)
     def _on_rows(self, rows):
         self.rows = [dict(row) for row in rows]
+        selection_blocker = QtCore.QSignalBlocker(self.table)
         self.table.setRowCount(len(rows))
         mismatches = 0
         for index, row in enumerate(rows):
@@ -1560,6 +1650,11 @@ class MainWindow(QtWidgets.QMainWindow):
             for column, value in enumerate(values):
                 text = f"{value:.3f}" if isinstance(value, float) and math.isfinite(value) else "—" if value is None else str(value)
                 self.table.setItem(index, column, QtWidgets.QTableWidgetItem(text))
+        del selection_blocker
+        map_assessment = assess_map([self._assessment_source(row) for row in self.rows])
+        self.map_assessment_label.setText("Map summary (separate from selected point)\n" +
+            "\n".join([map_assessment["title"], map_assessment["meaning"],
+                       *map_assessment["details"], map_assessment["action"]]))
         self.map_plot.clear()
         # clear() does not consistently clear LegendItem across pg releases.
         if self.map_plot.plotItem.legend:
@@ -1634,6 +1729,10 @@ class MainWindow(QtWidgets.QMainWindow):
                 self.image_item.clear()
                 self.zoom_item.clear()
                 self._on_rows(rows)
+                if rows:
+                    self.table.selectRow(0)
+                    self._assess_selection()
+                    self.tabs.setCurrentWidget(self.assessment_panel)
             self._log(f"Loaded {len(rows)} saved row(s). Offline data: no camera images reconstructed; imported results cannot authorize candidate return.")
         except Exception as exc:
             self._warn(f"Cannot load saved results: {exc}")
