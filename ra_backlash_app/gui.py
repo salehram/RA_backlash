@@ -1,0 +1,1439 @@
+"""Local desktop controller. All device access belongs to DeviceWorker.run().
+
+Stop is cooperative: a hung COM call can still require native mount controls.
+Image coordinates throughout this module are full-frame *binned* pixels.
+"""
+from __future__ import annotations
+
+import csv
+import hashlib
+import math
+import os
+import queue
+import sys
+import threading
+import time
+import uuid
+from collections import deque
+from dataclasses import asdict, dataclass, replace
+from pathlib import Path
+from types import MappingProxyType
+from typing import Any
+
+import numpy as np
+import pyqtgraph as pg
+from PySide6 import QtCore, QtWidgets
+
+from . import core, devices
+
+
+IDLE_STATES = {"idle", "completed"}
+ACTIVE_STATES = {"connecting", "preview", "acquiring", "slewing", "settling",
+                 "calibrating", "measuring", "analyzing", "awaiting_star", "stopping"}
+
+
+def finite(value, default=float("nan")):
+    try:
+        value = float(value)
+        return value if math.isfinite(value) else default
+    except (TypeError, ValueError):
+        return default
+
+
+def backlash_pixels(backlash, drift_px_s):
+    """Inferred RA-axis displacement, NOT an additional observed trail."""
+    b, v = finite(backlash), finite(drift_px_s)
+    return b * v / core.S_ARCSEC if b >= 0 and v > 0 else float("nan")
+
+
+def image_rect(origin, shape, step=1):
+    """Preserve absolute binned coordinates when displaying a decimated frame."""
+    return QtCore.QRectF(float(origin[0]) - .5, float(origin[1]) - .5,
+                        float(shape[1] * step), float(shape[0] * step))
+
+
+@dataclass(frozen=True)
+class FrameSnapshot:
+    image: np.ndarray
+    origin: tuple
+    step: int
+    t: float
+    x: float
+    y: float
+    quality: object
+
+
+class DeviceWorker(QtCore.QThread):
+    """Persistent single device owner; no Qt event loop or interrupting slots.
+
+    submit/stop/shutdown ONLY manipulate Python synchronization primitives.
+    Cancellation is cleared under the same lock as acceptance of a NEW task,
+    never by run() after a Stop. Controls within preview/map never clear it.
+    """
+    state_changed = QtCore.Signal(str)
+    event = QtCore.Signal(object)
+    frame = QtCore.Signal(object)
+    result = QtCore.Signal(object)
+    rows_changed = QtCore.Signal(object)
+    log = QtCore.Signal(str)
+    ready = QtCore.Signal(str)
+
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self.commands = queue.Queue()
+        self.cancel = core.Cancellation()
+        self._lock = threading.Lock()
+        self._busy = False
+        self._closing = threading.Event()
+        self.state = "disconnected"
+        # Dynamic ASCOM dispatch and simulator adapters share a runtime API;
+        # never expose these handles outside the owning worker.
+        self.mount: Any = None
+        self.cam: Any = None
+        self.clock: Any = None
+        self.tracker: core.Tracker | None = None
+        self.cfg = core.Config()
+        self.simulation = True
+        self.selected = None
+        self.geometry = False
+        self._last_frame = 0.
+        self._last_pose = 0.
+        self._live_results = {}
+        self._connection = ""
+        self._adjustment = False
+        self._fault = False
+        self._reconnect_allowed = True
+        self._workflow_tracking = None
+        # Kept true on an interrupted/failed slew, even if the adapter aborts.
+        self._slew_in_progress = False
+
+    def submit(self, name, **payload):
+        with self._lock:
+            if self._closing.is_set():
+                return False
+            if self._fault and name != "disconnect" and not (
+                    name == "connect" and self.state == "disconnected" and self._reconnect_allowed):
+                return False
+            if self._busy:
+                if self.state in {"preview", "awaiting_star"} and name in {"select", "auto_select", "skip"} and not self.cancel._event.is_set():
+                    self.commands.put((name, payload))
+                    return True
+                return False
+            allowed = ({"connect"} if self.state == "disconnected" else
+                       {"disconnect"} if self.state == "fault" else
+                       {"finish_adjustment", "disconnect"} if self._adjustment else
+                       {"disconnect", "preview", "select", "auto_select", "measure", "map", "plan", "slew_candidate", "pose"})
+            if name not in allowed:
+                return False
+            self.cancel.reset()
+            self._busy = True
+            self.commands.put((name, payload))
+            return True
+
+    def stop(self):
+        with self._lock:
+            self._busy = True
+            self.cancel.cancel()
+            self._drain()
+            # Wake awaiting_star / preview without a queued Qt slot.
+            self.commands.put(("_stop", {}))
+
+    def shutdown(self):
+        with self._lock:
+            self._closing.set()
+            self.cancel.cancel()
+            self._drain()
+            self.commands.put(("_shutdown", {}))
+
+    def _drain(self):
+        while True:
+            try:
+                self.commands.get_nowait()
+            except queue.Empty:
+                break
+
+    def _state(self, state):
+        with self._lock:
+            if state == "fault":
+                self._fault = True
+                self._reconnect_allowed = False
+            if self._fault and state not in {"disconnected", "connecting"}:
+                state = "fault"
+            self.state = state
+        self.state_changed.emit(state)
+
+    def _stop_motion(self, restore=False):
+        """Stop first; only safe cancellation may restore workflow-entry tracking."""
+        errors = []
+        try:
+            self.mount.stop()
+        except Exception as exc:
+            errors.append(str(exc))
+        tracking = (self._workflow_tracking if restore and not errors and not self._fault
+                    and not self._slew_in_progress and not self._adjustment else False)
+        try:
+            # With no workflow snapshot, ordinary preview/idle Stop leaves
+            # tracking alone. Fault, slew abort and adjustment always force OFF.
+            if tracking is not None:
+                self.mount.tracking(tracking)
+        except Exception as exc:
+            errors.append(str(exc))
+            try:
+                self.mount.tracking(False)
+            except Exception as off_error:
+                errors.append(str(off_error))
+        if errors:
+            self._state("fault")
+            raise RuntimeError("; ".join(errors))
+
+    def run(self):
+        com = None
+        try:
+            if os.name == "nt":
+                import pythoncom
+                pythoncom.CoInitialize()
+                com = pythoncom
+            while not self._closing.is_set():
+                name, payload = self.commands.get()
+                if name.startswith("_"):
+                    if name == "_stop":
+                        final = "adjustment" if self._adjustment else "idle" if self.mount else "disconnected"
+                        try:
+                            if self.mount:
+                                self._stop_motion(restore=True)
+                        except Exception as exc:
+                            self.log.emit(f"Stop failed: {exc}; use native controls")
+                            final = "fault"
+                        self._state(final)
+                        with self._lock:
+                            self._busy = not self.commands.empty()
+                        self.ready.emit(self.state)
+                    continue
+                final = "idle"
+                try:
+                    self.cancel.check()
+                    self._workflow_tracking = None
+                    self._slew_in_progress = False
+                    if self.mount and name in {"map", "measure", "slew_candidate"}:
+                        self._workflow_tracking = self.mount.get_tracking()
+                    self._dispatch(name, payload)
+                    self.cancel.check()
+                    final = "adjustment" if self._adjustment else "completed" if name in {"measure", "map"} else "idle"
+                    if self.mount is None:
+                        final = "disconnected"
+                except core.Cancelled as exc:
+                    self.log.emit(f"Stopped: {exc}")
+                    self._partial(exc)
+                    final = "adjustment" if self._adjustment else "idle" if self.mount else "disconnected"
+                    if getattr(exc, "partial_result", {}).get("cleanup_errors"):
+                        self._state("fault")
+                    if self.mount:
+                        try:
+                            self._stop_motion(restore=True)
+                        except Exception as cleanup:
+                            self.log.emit(f"Stop cleanup failed: {cleanup}; use native controls")
+                            final = "fault"
+                    if getattr(exc, "partial_result", {}).get("cleanup_errors"):
+                        final = "fault"
+                except Exception as exc:
+                    self.log.emit(f"FAULT: {type(exc).__name__}: {exc}")
+                    self._partial(exc)
+                    self._state("fault")
+                    final = "fault"
+                    if self.mount:
+                        try:
+                            self._stop_motion()
+                        except Exception as cleanup:
+                            self.log.emit(f"Cleanup failed: {cleanup}. Use native controls.")
+                finally:
+                    if self.mount:
+                        try:
+                            self._pose()
+                        except Exception as exc:
+                            self.log.emit(f"Pose unavailable: {exc}")
+                    # Stop/close can arrive during the final pose read, after
+                    # dispatch/exception cleanup. It must not be discarded.
+                    with self._lock:
+                        late_cancel = self.cancel._event.is_set()
+                        self._drain()
+                    # A Stop AFTER this atomic snapshot remains queued and is
+                    # handled next; never drain an unhandled late Stop.
+                    if self.mount and late_cancel:
+                        try:
+                            self._stop_motion(restore=True)
+                            if final == "completed":
+                                final = "idle"
+                        except Exception as exc:
+                            self.log.emit(f"Late Stop cleanup failed: {exc}; use native controls")
+                            final = "fault"
+                    # Busy remains true until state is published. GUI's ready
+                    # handler is the only point that re-enables launch actions.
+                    self._state(final)
+                    with self._lock:
+                        self._busy = not self.commands.empty()
+                    self.ready.emit(self.state)
+        except Exception as exc:
+            self.log.emit(f"Worker initialization failed: {exc}")
+            self._state("fault")
+        finally:
+            try:
+                if self.mount and self._closing.is_set():
+                    try:
+                        self._stop_motion(restore=True)
+                    except Exception as exc:
+                        self.log.emit(f"Close cleanup failed: {exc}; use native controls")
+                self._disconnect()
+            finally:
+                if com is not None:
+                    com.CoUninitialize()
+
+    def _partial(self, exc):
+        partial = getattr(exc, "partial_result", None)
+        if partial:
+            self.result.emit(dict(partial, imported=False))
+        path = getattr(exc, "partial_path", None)
+        if path:
+            self.log.emit(f"Partial data saved: {path}")
+
+    def _dispatch(self, name, p):
+        if name == "connect":
+            self._state("connecting")
+            self.cfg = replace(p["cfg"]).validate()
+            self.simulation = p.get("simulation", True)
+            telescope, camera = p.get("telescope", ""), p.get("camera", "")
+            if not self.simulation:
+                telescope = telescope or devices._choose("Telescope")
+                self.cancel.check()
+                camera = camera or devices._choose("Camera")
+                # Chooser-resolved camera gets its own local profile too.
+                profile = QtCore.QSettings("RA Backlash", "Desktop")
+                profile.beginGroup("cameras/" + hashlib.sha256(camera.encode()).hexdigest())
+                for key, cast in (("exposure", float), ("binning", int), ("roi", int)):
+                    if profile.contains(key):
+                        setattr(self.cfg, key, cast(profile.value(key)))
+                profile.endGroup()
+                self.cfg.validate()
+            self.mount, self.cam, self.clock = devices.open_devices(
+                self.simulation, self.cfg, self.cancel, telescope, camera)
+            self._connection = uuid.uuid4().hex
+            self._live_results.clear()
+            self.selected = None
+            self.geometry = self.simulation
+            self.event.emit(dict(type="connected", simulation=self.simulation,
+                                 camera=camera or "simulator", telescope=telescope or "simulator",
+                                 width=self.cam.W, height=self.cam.H, settings=asdict(self.cfg),
+                                 can_slew=bool(self.mount.can_slew), connection=self._connection))
+            self._pose()
+            self.cancel.check()
+            if self._reconnect_allowed:
+                self._fault = False
+            self._reconnect_allowed = False
+        elif name == "disconnect":
+            self._disconnect()
+        elif name == "finish_adjustment":
+            if not self._adjustment or not p.get("confirmed"):
+                raise ValueError("Explicit motion confirmation is required")
+            self.cancel.check()
+            self.mount.stop()
+            self.mount.tracking(True)
+            self._adjustment = False
+            self.selected = None
+            self.log.emit("Adjustment finished by confirmation. Reacquire and recalibrate before measurement.")
+        elif name == "pose":
+            self._pose()
+        else:
+            cfg = replace(p.get("cfg", self.cfg)).validate()
+            if cfg.binning != self.cfg.binning:
+                raise ValueError("Reconnect to change camera binning")
+            self.cfg = cfg
+            self.mount.cfg = self.cam.cfg = cfg
+            if name == "preview":
+                self._preview(p.get("continuous", False))
+            elif name in {"select", "auto_select"}:
+                if not self._acquire(p.get("position") if name == "select" else None):
+                    raise ValueError("No suitable star at selection; preview and retry")
+            elif name == "measure":
+                self._measure_here()
+            elif name in {"plan", "map"}:
+                if name == "map":
+                    self._authorize(p)
+                rows = core.plan_points(p["angles"], self.mount.latitude(), cfg.min_alt, cfg.dec)
+                self.log.emit(f"Plan: {len(rows)} requested; {sum(row['status'] == 'ready' for row in rows)} feasible endpoints. Inspect adjusted Dec / skipped reasons; paths are not collision-validated.")
+                self.rows_changed.emit([dict(row) for row in rows])
+                if name == "map":
+                    self._map(rows)
+            elif name == "slew_candidate":
+                self._authorize(p)
+                row = self._live_results.get(p.get("point_id"))
+                if not row or core.candidate([row]) is None or row.get("connection") != self._connection:
+                    raise ValueError("Candidate must be a quality-valid measurement from this connection; imports are read-only")
+                if not row.get("geometry_verified") or not row.get("pose"):
+                    raise ValueError("Candidate pose/geometry has not been verified")
+                self._confirm_candidate(row)
+            else:
+                raise ValueError(f"Unknown command {name}")
+
+    def _disconnect(self):
+        errors = []
+        # Drop Tracker's camera reference before COM is uninitialized.
+        self.tracker = None
+        # No movement on ordinary idle connection/disconnection. Adapters stop
+        # their own active operations; workflows handle motion cleanup first.
+        for device in (self.cam, self.mount):
+            if device is not None:
+                try:
+                    device.disconnect()
+                except Exception as exc:
+                    errors.append(str(exc))
+        self.cam = self.mount = self.clock = None
+        self.selected = None
+        self._live_results.clear()
+        self._adjustment = False
+        self._reconnect_allowed = not errors
+        if errors:
+            self._state("fault")
+        self.event.emit(dict(type="disconnected"))
+        if errors:
+            self.log.emit("Disconnect errors; verify native controls: " + "; ".join(errors))
+
+    def _pose(self) -> dict[str, Any]:
+        ra, dec = self.mount.ra_dec()
+        lst = self.mount.lst()
+        ha = (lst - ra + 12) % 24 - 12
+        lat = self.mount.latitude()
+        pose: dict[str, Any] = dict(ra=ra, dec=dec, lst=lst, ha=ha,
+                    angle=core.legacy.angle_from_ha(ha), latitude=lat,
+                    alt=core.legacy.altitude(lat, dec, ha),
+                    pier=self.mount.pier_side(), tracking=self.mount.get_tracking())
+        if not all(math.isfinite(pose[key]) for key in ("ra", "dec", "lst", "ha", "angle", "latitude", "alt")):
+            raise RuntimeError("Nonfinite mount pose")
+        self.event.emit(dict(type="pose", **pose))
+        return pose
+
+    def _authorize(self, p):
+        if not p.get("confirmed"):
+            raise ValueError("Motion/limits/collision confirmation required")
+        pose = self._pose()
+        if not self.mount.can_slew:
+            raise ValueError("Async slew required")
+        if not self.simulation:
+            if not p.get("geometry_verified") or pose["latitude"] <= 0 or pose["pier"] not in {"East", "West"}:
+                raise ValueError("Validate northern counterweight-down GEM geometry and known driver pier state")
+            if int(self.mount.t.AlignmentMode) != 2:
+                raise ValueError("Driver does not report German equatorial alignment")
+        self.geometry = True
+
+    def _verify_pose(self, target, dec, pier=None, tolerance=.5):
+        pose = self._pose()
+        if (abs(pose["angle"] - target) > tolerance or abs(pose["dec"] - dec) > .25
+                or pose["alt"] < self.cfg.min_alt or (pier and pose["pier"] != pier)):
+            raise RuntimeError("Actual pose/pier/altitude differs from validated destination; replan in native controls")
+        return pose
+
+    def _slew(self, angle, dec, expected_pier=None):
+        if not self.geometry or not math.isfinite(angle) or angle == 0 or abs(angle) > 82:
+            raise ValueError("Unsupported/unverified mechanical angle")
+        before = self._pose()
+        if not self.simulation and before["pier"] not in {"East", "West"}:
+            raise RuntimeError("Current driver pier state is unknown")
+        ha = core.legacy.ha_from_angle(angle)
+        # Recomputed immediately before EACH slew, including candidate return.
+        ra = (self.mount.lst() - ha) % 24
+        if core.legacy.altitude(self.mount.latitude(), dec, ha) < self.cfg.min_alt:
+            raise ValueError("Destination below minimum altitude")
+        pier = "sim"
+        if not self.simulation:
+            try:
+                pier = {0: "East", 1: "West"}.get(int(self.mount.t.DestinationSideOfPier(ra, dec)), "Unknown")
+            except Exception as exc:
+                raise RuntimeError("Destination pier prediction unavailable; automated motion refused") from exc
+        if pier == "Unknown" or (expected_pier is not None and pier != expected_pier):
+            raise ValueError("Unknown/different destination pier state")
+        self._state("slewing")
+        self.cancel.check()
+        self._slew_in_progress = True
+        self.mount.slew(ra, dec, self.cancel)
+        self.cancel.check()
+        self._verify_pose(angle, dec, pier)
+        self._slew_in_progress = False
+        self._state("settling")
+        self.cancel.wait(self.cfg.settle, self.clock)
+        return self._verify_pose(angle, dec, pier)
+
+    def _confirm_candidate(self, candidate):
+        """Return, independently remeasure, then return again before adjustment."""
+        angle, dec = candidate["angle"], candidate["pose"]["dec"]
+        pier = candidate["pose"]["pier"]
+        folder = core.create_run(self.cfg.out)
+        confirmation: dict[str, Any] = dict(
+            angle=angle, dec=dec, expected_pier=pier,
+            candidate_point_id=candidate["point_id"],
+            role="candidate_confirmation", status="running")
+        rows = [confirmation]
+        core.save_manifest(folder, rows, "running")
+        try:
+            self._slew(angle, dec, expected_pier=pier)
+            if not self._acquire() and not self._wait_star(confirmation):
+                raise core.Cancelled("Candidate confirmation skipped; no adjustment")
+            # Acquisition/manual waiting must not move us to a different pose.
+            start_pose = self._verify_pose(angle, dec, pier)
+            self.cancel.check()
+            result = self._perform()
+            result.update(role="candidate_confirmation", candidate_point_id=candidate["point_id"],
+                          confirmation_start_pose=start_pose, expected_pier=pier)
+            confirmation.update(self._record(result, folder, "confirmation_000", angle))
+            core.save_manifest(folder, rows, "confirming")
+            self.rows_changed.emit([dict(confirmation)])
+            self.cancel.check()
+            if (core.candidate([confirmation]) is None or result.get("cleanup_errors")
+                    or confirmation["pose"]["pier"] != pier):
+                raise RuntimeError("Confirmation is not quality-valid; adjustment refused")
+            # Calibration/reversals moved the axis. Recompute the requested
+            # mechanical destination using current LST, never the end pose.
+            self._slew(angle, dec, expected_pier=pier)
+            self.cancel.check()
+            self.mount.stop()
+            self.mount.tracking(False)
+            achieved = self._verify_pose(angle, dec, pier)
+            if achieved["tracking"]:
+                raise RuntimeError("Driver did not confirm tracking OFF")
+            self.cancel.check()
+            confirmation.update(adjustment_pose=achieved, confirmation_status="confirmed")
+            core.save_manifest(folder, rows, "completed")
+            self.cancel.check()
+            self._adjustment = True
+            self.selected = None
+            self.log.emit("ADJUSTMENT: fresh quality-valid confirmation saved; requested pose verified again, RA stopped / tracking OFF. No automatic mesh changes. Motors may remain energized.")
+        except Exception as exc:
+            confirmation.update(confirmation_status="cancelled" if isinstance(exc, core.Cancelled) else "failed",
+                                reason=str(exc), partial_path=str(getattr(exc, "partial_path", "")))
+            if confirmation["status"] == "running":
+                confirmation["status"] = confirmation["confirmation_status"]
+            core.save_manifest(folder, rows, confirmation["confirmation_status"])
+            raise
+        finally:
+            self.rows_changed.emit([dict(confirmation)])
+
+    def _publish_frame(self, frame, force=False):
+        now = time.monotonic()
+        if not force and now - self._last_frame < .10:
+            return
+        self._last_frame = now
+        source = frame["image"]
+        step = max(1, math.ceil(max(source.shape) / 1400))
+        # bytes backing prevents re-enabling WRITEABLE, not just accidental writes.
+        small = np.asarray(source[::step, ::step], dtype=np.float32)
+        image = np.frombuffer(small.tobytes(), dtype=np.float32).reshape(small.shape)
+        quality = MappingProxyType({k: frame.get(k) for k in ("snr", "fwhm", "saturated")})
+        self.frame.emit(FrameSnapshot(image, tuple(frame["origin"]), step,
+                                      frame["t"], frame.get("x", float("nan")),
+                                      frame.get("y", float("nan")), quality))
+
+    def _acquire(self, position=None):
+        self._state("acquiring")
+        self.tracker = core.Tracker(self.cam, self.clock, self.cfg, self.cancel,
+                                    lambda f: self._publish_frame(f, force=True))
+        found = self.tracker.acquire(position)
+        self.selected = self.tracker.selected if found else None
+        self.event.emit(dict(type="selected", position=self.selected))
+        return found
+
+    def _preview(self, continuous):
+        self._state("preview")
+        while True:
+            self.cancel.check()
+            self.cam.set_roi(0, 0, self.cam.W, self.cam.H)
+            t, image, origin = self.cam.expose(self.clock, self.cfg.exposure)
+            x, y = self.selected or (float("nan"), float("nan"))
+            self._publish_frame(dict(image=image, origin=origin, t=t, x=x, y=y), force=not continuous)
+            if time.monotonic() - self._last_pose > 2:
+                self._last_pose = time.monotonic()
+                self._pose()
+            if not continuous:
+                return
+            # Real wall pacing prevents the fast simulator flooding the GUI.
+            if self.cancel._event.wait(.05):
+                self.cancel.check()
+            try:
+                command, p = self.commands.get_nowait()
+            except queue.Empty:
+                continue
+            self.cancel.check()
+            if command in {"select", "auto_select"}:
+                if not self._acquire(p.get("position") if command == "select" else None):
+                    self.log.emit("No suitable star; click to retry or Stop")
+                self._state("preview")
+
+    def _measurement_event(self, event):
+        if event["type"] == "phase":
+            self._state("measuring" if event["phase"].startswith(("reverse", "forward")) else "calibrating")
+        self.event.emit(dict(event))
+
+    def _perform(self):
+        assert self.tracker is not None, "Acquire a star before measurement"
+        self.tracker.on_frame = self._publish_frame
+        result = core.measure(self.mount, self.tracker, self.clock, self.cfg,
+                              self.cancel, self._measurement_event)
+        self._state("analyzing")
+        # Tracker.selected is the acquisition position; use the last tracked
+        # centroid instead, so a subsequent manual-preserving measurement does
+        # not search at an obsolete pre-calibration coordinate.
+        last = self.tracker._last
+        self.selected = tuple(last[1:]) if last is not None else self.tracker.selected
+        return result
+
+    def _record(self, result, folder, tag, requested=None):
+        pose = self._pose()
+        row = {k: v for k, v in result.items() if not k.startswith("_")}
+        row.update(point_id=tag, angle=pose["angle"] if requested is None else requested,
+                   achieved_angle=pose["angle"], dec=pose["dec"], pose=pose,
+                   simulation=self.simulation, connection=self._connection,
+                   geometry_verified=self.geometry, imported=False, status=result.get("status", "completed"))
+        path = core.save_result(result, folder, tag, row)
+        row["path"] = str(path)
+        self._live_results[tag] = dict(row)
+        self.result.emit(dict(result, **{k: v for k, v in row.items() if k not in result}))
+        self.log.emit(f"Saved {path}")
+        return row
+
+    def _measure_here(self):
+        folder = core.create_run(self.cfg.out)
+        rows = []
+        try:
+            # Preserve a manual/previous identity through fresh full-frame
+            # acquisition; failure NEVER silently falls back to brightest.
+            if not self._acquire(self.selected):
+                raise ValueError("Selected star unavailable; preview and explicitly select/auto-select again")
+            rows.append(self._record(self._perform(), folder, "point_000"))
+            core.save_manifest(folder, rows, "completed")
+            self.rows_changed.emit(rows)
+        except Exception as exc:
+            rows.append(dict(status="cancelled" if isinstance(exc, core.Cancelled) else "failed", reason=str(exc),
+                             partial_path=str(getattr(exc, "partial_path", ""))))
+            core.save_manifest(folder, rows, rows[-1]["status"])
+            raise
+
+    def _wait_star(self, row):
+        """Safe retry of THIS field, no hidden next-field/reposition command."""
+        self._state("awaiting_star")
+        self.event.emit(dict(type="awaiting_star", angle=row["angle"], dec=row["dec"]))
+        while True:
+            self.cancel.check()
+            try:
+                name, p = self.commands.get(timeout=.1)
+            except queue.Empty:
+                continue
+            self.cancel.check()
+            if name == "skip":
+                return False
+            if name not in {"select", "auto_select"}:
+                continue
+            # Time spent selecting changes HA if not tracking. Never reuse a
+            # stale target or automatically slew on a manual retry.
+            self._verify_pose(row["angle"], row["dec"], row["expected_pier"])
+            if self._acquire(p.get("position") if name == "select" else None):
+                self._verify_pose(row["angle"], row["dec"], row["expected_pier"])
+                return True
+            self.log.emit("Retry found no qualified star; select another or Skip")
+            self._state("awaiting_star")
+
+    def _map(self, rows):
+        folder = core.create_run(self.cfg.out)
+        for row in rows:
+            if row["status"] == "ready":
+                row["status"] = "pending"
+        status = "running"
+        core.save_manifest(folder, rows, status)
+        try:
+            for index, row in enumerate(rows):
+                self.cancel.check()
+                if row["status"] == "skipped":
+                    continue
+                row["status"] = "running"
+                core.save_manifest(folder, rows, status)
+                pose = self._slew(row["angle"], row["dec"])
+                row["expected_pier"] = pose["pier"]
+                if not self._acquire() and not self._wait_star(row):
+                    row.update(status="skipped", reason="Operator skipped: no selected star")
+                else:
+                    measured = self._record(self._perform(), folder, f"point_{index:03d}", row["angle"])
+                    row.update(measured)
+                core.save_manifest(folder, rows, status)
+                self.rows_changed.emit([dict(r) for r in rows])
+            status = "completed"
+        except Exception as exc:
+            status = "cancelled" if isinstance(exc, core.Cancelled) else "failed"
+            for row in rows:
+                if row["status"] == "running":
+                    row.update(status=status, reason=str(exc), partial_path=str(getattr(exc, "partial_path", "")))
+                elif row["status"] == "pending":
+                    row.update(status="cancelled" if status == "cancelled" else "skipped", reason="Map ended before this point")
+            raise
+        finally:
+            core.save_manifest(folder, rows, status)
+            self.rows_changed.emit([dict(r) for r in rows])
+
+
+class ConnectionDialog(QtWidgets.QDialog):
+    def __init__(self, settings, parent=None):
+        super().__init__(parent)
+        self.setWindowTitle("Connect one mount + one camera")
+        self.resize(540, 250)
+        form = QtWidgets.QFormLayout(self)
+        self.simulation = QtWidgets.QCheckBox("Simulation — no hardware")
+        self.simulation.setChecked(True)
+        self.telescope = QtWidgets.QLineEdit()
+        self.camera = QtWidgets.QComboBox()
+        self.camera.setEditable(True)
+        self.camera.addItem("")
+        for item in settings.value("camera_ids", [], type=list):
+            if item != "simulator":
+                self.camera.addItem(item)
+        self.telescope.setPlaceholderText("Blank opens ASCOM telescope chooser")
+        self.camera.lineEdit().setPlaceholderText("Blank opens ASCOM camera chooser (any vendor)")
+        form.addRow(self.simulation)
+        form.addRow("Telescope ProgID", self.telescope)
+        form.addRow("Camera ProgID / saved profile", self.camera)
+        note = QtWidgets.QLabel("Close other camera clients and stop guiding/dithering first.\n"
+                                "Connection alone sends no mount motion or tracking commands.")
+        note.setWordWrap(True)
+        form.addRow(note)
+        buttons = QtWidgets.QDialogButtonBox(QtWidgets.QDialogButtonBox.StandardButton.Ok | QtWidgets.QDialogButtonBox.StandardButton.Cancel)
+        buttons.accepted.connect(self.accept)
+        buttons.rejected.connect(self.reject)
+        form.addRow(buttons)
+        self.simulation.toggled.connect(lambda on: (self.telescope.setEnabled(not on), self.camera.setEnabled(not on)))
+        self.telescope.setEnabled(False)
+        self.camera.setEnabled(False)
+
+
+DARK_STYLE = """
+QMainWindow, QDialog, QWidget { background: #101923; color: #dbe5ef; font-size: 12px; }
+QLabel#title { font-size: 22px; font-weight: 650; color: #f0f7ff; }
+QLabel#banner { background: #213d51; color: #91ddff; padding: 10px; border-radius: 6px; font-weight: 600; }
+QGroupBox { border: 1px solid #304253; border-radius: 7px; margin-top: 16px; padding: 12px 7px 7px; font-weight: 600; }
+QGroupBox::title { subcontrol-origin: margin; left: 10px; padding: 0 4px; }
+QPushButton { background: #263b4d; border: 1px solid #40596c; border-radius: 5px; padding: 7px 12px; }
+QPushButton:hover { background: #34516a; } QPushButton:disabled { color: #667685; background: #192630; border-color: #263541; }
+QPushButton#primary { background: #116c8c; color: white; font-weight: bold; }
+QPushButton#primary:disabled { background: #203d49; color: #788e9a; }
+QPushButton#stop { background: #a53d43; color: white; font-weight: bold; font-size: 14px; }
+QPushButton#stop:disabled { background: #493039; color: #97797f; }
+QLineEdit, QSpinBox, QDoubleSpinBox, QComboBox, QPlainTextEdit { background: #172633; border: 1px solid #344959; border-radius: 4px; padding: 4px; selection-background-color: #176f8d; }
+QTableWidget { background: #14212c; alternate-background-color: #1b2b38; gridline-color: #2b3f50; border: 0; }
+QHeaderView::section { background: #233848; color: #b6ccde; padding: 5px; border: 0; }
+QTabBar::tab { background: #192b3a; padding: 8px 18px; } QTabBar::tab:selected { background: #28516a; }
+QSplitter::handle { background: #263949; } QScrollArea { border: 0; }
+QStatusBar { background: #192b38; } QToolTip { background: #294254; color: white; border: 1px solid #6c91aa; }
+"""
+
+
+class MainWindow(QtWidgets.QMainWindow):
+    def __init__(self, parent=None, *, start_worker=True, settings=None):
+        super().__init__(parent)
+        self.setWindowTitle("RA Backlash · Observatory Workbench")
+        self.resize(1500, 980)
+        self.setMinimumSize(980, 680)
+        self.settings = settings or QtCore.QSettings("RA Backlash", "Desktop")
+        self.state = "disconnected"
+        self.connected = False
+        self.simulation = True
+        self.pending = False
+        self.closing = False
+        self.camera_id = "simulator"
+        self.connected_binning = 1
+        self.current_connection = None
+        self.can_slew = False
+        self.pose = None
+        self.rows = []
+        self.baseline = []
+        self.last_result = None
+        self.trail = deque(maxlen=2000)
+        self.samples = deque(maxlen=12000)
+        self.calibration = None
+        self._auto_range = True
+        self._build_ui()
+        self.setStyleSheet(DARK_STYLE)
+        self.worker = DeviceWorker(self)
+        self.worker.state_changed.connect(self._on_state)
+        self.worker.ready.connect(self._on_ready)
+        self.worker.event.connect(self._on_event)
+        self.worker.frame.connect(self._on_frame)
+        self.worker.result.connect(self._on_result)
+        self.worker.rows_changed.connect(self._on_rows)
+        self.worker.log.connect(self._log)
+        self.worker.finished.connect(self._worker_finished)
+        if start_worker:
+            self.worker.start()
+        self._gate()
+        self._log("Simulator selected by default. Software Stop cannot interrupt a hung driver; keep native mount controls available.")
+
+    def _build_ui(self):
+        root = QtWidgets.QWidget()
+        self.setCentralWidget(root)
+        layout = QtWidgets.QVBoxLayout(root)
+        title = QtWidgets.QHBoxLayout()
+        label = QtWidgets.QLabel("RA BACKLASH  /  Workbench")
+        label.setObjectName("title")
+        title.addWidget(label)
+        title.addStretch()
+        self.state_label = QtWidgets.QLabel("DISCONNECTED")
+        title.addWidget(self.state_label)
+        layout.addLayout(title)
+        self.banner = QtWidgets.QLabel("SIMULATION DEFAULT · No hardware connected · RA-axis arcseconds, not on-sky arcseconds")
+        self.banner.setObjectName("banner")
+        self.banner.setWordWrap(True)
+        layout.addWidget(self.banner)
+        split = QtWidgets.QSplitter()
+        layout.addWidget(split, 1)
+        sidebar_scroll = QtWidgets.QScrollArea()
+        sidebar_scroll.setWidgetResizable(True)
+        sidebar_scroll.setMinimumWidth(345)
+        sidebar_scroll.setMaximumWidth(430)
+        sidebar = QtWidgets.QWidget()
+        self.sidebar_layout = QtWidgets.QVBoxLayout(sidebar)
+        sidebar_scroll.setWidget(sidebar)
+        split.addWidget(sidebar_scroll)
+        connection = QtWidgets.QGroupBox("01  Connection & camera")
+        box = QtWidgets.QVBoxLayout(connection)
+        self.device_label = QtWidgets.QLabel("No devices connected")
+        self.device_label.setWordWrap(True)
+        box.addWidget(self.device_label)
+        self.connect_button = self._button("Connect devices…", self._connect_dialog, box)
+        self.disconnect_button = self._button("Disconnect", lambda: self._launch("disconnect"), box)
+        self.sidebar_layout.addWidget(connection)
+        self.settings_box = QtWidgets.QGroupBox("02  Acquisition & measurement")
+        form = QtWidgets.QFormLayout(self.settings_box)
+        self.fields = {}
+        self._field(form, "exposure", "Exposure (s)", .1, .001, 30, 3)
+        self._field(form, "acq_exposure", "Acquire (s)", 1., .001, 30, 3)
+        self._field(form, "binning", "Symmetric bin (reconnect)", 1, 1, 16)
+        self._field(form, "roi", "Tracking ROI (binned px)", 160, 24, 4096)
+        self._field(form, "cycles", "Reversal cycles", 3, 1, 30)
+        self.sidebar_layout.addWidget(self.settings_box)
+        self.advanced_box = QtWidgets.QGroupBox("Advanced · recalibrated each run")
+        adv = QtWidgets.QFormLayout(self.advanced_box)
+        for key, label, value, low, high in (
+            ("min_alt", "Minimum altitude (°)", 25., 0., 85.),
+            ("dec", "Preferred Dec (°)", 0., -75., 75.),
+            ("settle", "Settle (s)", 3., 0., 120.),
+            ("rate", "Reversal rate (sidereal)", 2., 1.01, 20.),
+            ("phase", "Reverse phase (s)", 5., 2., 120.),
+            ("cal", "Calibration phase (s)", 4., 2., 120.),
+            ("min_snr", "Minimum SNR", 6., 1., 100.)):
+            self._field(adv, key, label, value, low, high, 2)
+        self.sidebar_layout.addWidget(self.advanced_box)
+        self.planner_box = QtWidgets.QGroupBox("03  Signed-angle map planner")
+        form = QtWidgets.QFormLayout(self.planner_box)
+        self._field(form, "count", "Points / signed group", 3, 1, 20)
+        self._field(form, "first", "First magnitude (°)", 25., .1, 82., 2)
+        self._field(form, "spacing", "Spacing (°)", 25., .1, 82., 2)
+        self.side = QtWidgets.QComboBox()
+        self.side.addItems(["both", "negative", "positive"])
+        form.addRow("Signed group (not pier side)", self.side)
+        self.angle_list = QtWidgets.QLineEdit()
+        self.angle_list.setPlaceholderText("Optional: -75,-50,-25,25,50,75")
+        form.addRow("Explicit ordered angles", self.angle_list)
+        self.geometry_check = QtWidgets.QCheckBox("I verified northern, counterweight-down\nGEM geometry and driver pier interpretation")
+        self.geometry_check.setToolTip("Operator validation is not a guarantee of collision clearance. Unsupported geometry is refused.")
+        form.addRow(self.geometry_check)
+        self.plan_button = QtWidgets.QPushButton("Preview actual feasible plan")
+        self.plan_button.clicked.connect(lambda: self._plan_or_map(False))
+        form.addRow(self.plan_button)
+        self.map_button = QtWidgets.QPushButton("Start map…")
+        self.map_button.clicked.connect(lambda: self._plan_or_map(True))
+        form.addRow(self.map_button)
+        self.refine_button = QtWidgets.QPushButton("Refine selected candidate…")
+        self.refine_button.clicked.connect(self._refine)
+        form.addRow(self.refine_button)
+        self.sidebar_layout.addWidget(self.planner_box)
+        self.sidebar_layout.addStretch()
+        center = QtWidgets.QSplitter(QtCore.Qt.Orientation.Vertical)
+        split.addWidget(center)
+        split.setSizes([365, 1135])
+        split.setStretchFactor(1, 1)
+        image_panel = QtWidgets.QWidget()
+        image_layout = QtWidgets.QVBoxLayout(image_panel)
+        actions = QtWidgets.QHBoxLayout()
+        self.preview_button = self._button("Full frame", lambda: self._launch("preview", continuous=False), actions)
+        self.live_button = self._button("Live preview", lambda: self._launch("preview", continuous=True), actions)
+        self.auto_button = self._button("Auto-select / retry", lambda: self._launch("auto_select"), actions)
+        self.measure_button = self._button("Measure here", self._measure, actions)
+        self.measure_button.setObjectName("primary")
+        self.skip_button = self._button("Skip field", lambda: self._launch("skip"), actions)
+        self._button("Fit image", self._fit_image, actions)
+        image_layout.addLayout(actions)
+        views = QtWidgets.QSplitter()
+        self.image_plot = pg.PlotWidget(title="Camera · click a star · full-frame binned coordinates")
+        self.image_plot.setAspectLocked(True)
+        self.image_plot.invertY(True)
+        self.image_plot.setLabel("bottom", "Sensor x", units="px")
+        self.image_plot.setLabel("left", "Sensor y", units="px")
+        self.image_item = pg.ImageItem(axisOrder="row-major")
+        self.image_plot.addItem(self.image_item)
+        self.trail_item = self.image_plot.plot(pen=pg.mkPen("#47dfed", width=1.5))
+        self.star_item = self.image_plot.plot(pen=None, symbol="+", symbolPen="#e9f4ff", symbolSize=18)
+        self.bracket_item = self.image_plot.plot(pen=pg.mkPen("#ffac59", width=2))
+        self.direction_item = self.image_plot.plot(pen=pg.mkPen("#92a7bc", style=QtCore.Qt.PenStyle.DashLine))
+        self.image_plot.scene().sigMouseClicked.connect(self._image_clicked)
+        views.addWidget(self.image_plot)
+        self.zoom_plot = pg.PlotWidget(title="Selected star · 64 × 64 binned px")
+        self.zoom_plot.setAspectLocked(True)
+        self.zoom_plot.invertY(True)
+        self.zoom_item = pg.ImageItem(axisOrder="row-major")
+        self.zoom_plot.addItem(self.zoom_item)
+        views.addWidget(self.zoom_plot)
+        views.setSizes([850, 230])
+        image_layout.addWidget(views, 1)
+        self.quality_label = QtWidgets.QLabel("Cyan: observed centroid trail   ·   Orange: separately anchored inferred B × v₀ / S   ·   No calibrated confidence intervals")
+        self.quality_label.setWordWrap(True)
+        image_layout.addWidget(self.quality_label)
+        center.addWidget(image_panel)
+        tabs = QtWidgets.QTabWidget()
+        self.time_plot = pg.PlotWidget(title="Raw sensor coordinates vs time · calibration required for RA projection")
+        self.time_plot.addLegend()
+        self.time_plot.setLabel("bottom", "Elapsed", units="s")
+        self.time_plot.setLabel("left", "Position", units="px")
+        self.x_curve = self.time_plot.plot(pen="#48dfea", name="x / RA-axis position")
+        self.y_curve = self.time_plot.plot(pen="#9a9eea", name="y / orthogonal diagnostic")
+        self.fit_items = []
+        tabs.addTab(self.time_plot, "Trajectory & transitions")
+        self.map_plot = pg.PlotWidget(title="Measured backlash · diagnostic allowances, not confidence intervals")
+        self.map_plot.setLabel("bottom", "Signed mechanical angle (not pier side)", units="°")
+        self.map_plot.setLabel("left", "RA-axis backlash", units="arcsec")
+        self.map_plot.addLegend()
+        tabs.addTab(self.map_plot, "Map & baseline")
+        self.table = QtWidgets.QTableWidget(0, 11)
+        self.table.setHorizontalHeaderLabels(["Angle °", "HA h", "Dec °", "Alt °", "State / quality", "B arcsec", "Diagnostic ±", "Fwd → rev", "Rev → fwd", "N", "Reason / comparison"])
+        self.table.setAlternatingRowColors(True)
+        self.table.setSelectionBehavior(QtWidgets.QAbstractItemView.SelectionBehavior.SelectRows)
+        self.table.setSelectionMode(QtWidgets.QAbstractItemView.SelectionMode.SingleSelection)
+        self.table.setEditTriggers(QtWidgets.QAbstractItemView.EditTrigger.NoEditTriggers)
+        self.table.horizontalHeader().setSectionResizeMode(QtWidgets.QHeaderView.ResizeMode.ResizeToContents)
+        self.table.horizontalHeader().setStretchLastSection(True)
+        self.table.itemSelectionChanged.connect(self._gate)
+        tabs.addTab(self.table, "Plan & measurements")
+        center.addWidget(tabs)
+        center.setSizes([490, 260])
+        footer = QtWidgets.QHBoxLayout()
+        self.import_button = self._button("Import saved results…", lambda: self._import(False), footer)
+        self.baseline_button = self._button("Select saved baseline…", lambda: self._import(True), footer)
+        self.candidate_button = self._button("Return to selected candidate…", self._return_candidate, footer)
+        self.finish_button = self._button("Finish adjustment / enable tracking…", self._finish_adjustment, footer)
+        self.stop_button = self._button("■  STOP", self._stop, footer)
+        self.stop_button.setObjectName("stop")
+        self.stop_button.setMinimumWidth(120)
+        layout.addLayout(footer)
+        self.log_view = QtWidgets.QPlainTextEdit()
+        self.log_view.setReadOnly(True)
+        self.log_view.setMaximumBlockCount(1500)
+        self.log_view.setMaximumHeight(105)
+        layout.addWidget(self.log_view)
+        self.pose_label = QtWidgets.QLabel("No pose · Stop is not a hardware emergency stop")
+        self.statusBar().addWidget(self.pose_label, 1)
+        refresh = QtWidgets.QPushButton("Refresh pose")
+        refresh.clicked.connect(lambda: self._launch("pose"))
+        self.pose_button = refresh
+        self.statusBar().addPermanentWidget(refresh)
+
+    def _button(self, text, callback, layout):
+        button = QtWidgets.QPushButton(text)
+        button.clicked.connect(callback)
+        layout.addWidget(button)
+        return button
+
+    def _field(self, form, key, label, value, low, high, decimals=None):
+        widget = QtWidgets.QSpinBox() if decimals is None else QtWidgets.QDoubleSpinBox()
+        if decimals is not None:
+            widget.setDecimals(decimals)
+        widget.setRange(low, high)
+        widget.setValue(value)
+        self.fields[key] = widget
+        form.addRow(label, widget)
+
+    def _config(self):
+        keys = asdict(core.Config())
+        values = {key: widget.value() for key, widget in self.fields.items() if key in keys}
+        return core.Config(**values).validate()
+
+    def _angles(self):
+        text = self.angle_list.text().strip()
+        if text:
+            values = [float(v.strip()) for v in text.split(",")]
+            if not values or len(values) > 60 or len(set(values)) != len(values) or any(not math.isfinite(v) or v == 0 or abs(v) > 82 for v in values):
+                raise ValueError("Use at most 60 unique nonzero finite angles within ±82°")
+            return values
+        return core.generate_angles(self.fields["count"].value(), self.fields["spacing"].value(),
+                                    self.fields["first"].value(), self.side.currentText())
+
+    def _launch(self, name, **payload):
+        try:
+            if name not in {"connect", "disconnect", "finish_adjustment", "skip", "pose"}:
+                payload.setdefault("cfg", self._config())
+            accepted = self.worker.submit(name, **payload)
+            if accepted and self.connected and name not in {"connect", "skip", "pose"}:
+                self._save_profile()
+            if accepted and not (self.state in {"preview", "awaiting_star"} and name in {"select", "auto_select", "skip"}):
+                self.pending = True
+                self._gate()
+            return accepted
+        except Exception as exc:
+            self._warn(str(exc))
+            return False
+
+    def _connect_dialog(self):
+        dialog = ConnectionDialog(self.settings, self)
+        if dialog.exec() != QtWidgets.QDialog.DialogCode.Accepted:
+            return
+        try:
+            camera = dialog.camera.currentText().strip()
+            simulation = dialog.simulation.isChecked()
+            self._load_profile("simulator" if simulation else camera)
+            self._launch("connect", cfg=self._config(), simulation=simulation,
+                         camera=camera, telescope=dialog.telescope.text().strip())
+        except Exception as exc:
+            self._warn(str(exc))
+
+    def _load_profile(self, camera):
+        if not camera:
+            return
+        prefix = "cameras/" + hashlib.sha256(camera.encode()).hexdigest() + "/"
+        for key in ("exposure", "binning", "roi"):
+            if self.settings.contains(prefix + key):
+                self.fields[key].setValue(float(self.settings.value(prefix + key)) if key == "exposure" else int(self.settings.value(prefix + key)))
+
+    def _save_profile(self):
+        prefix = "cameras/" + hashlib.sha256(self.camera_id.encode()).hexdigest() + "/"
+        for key in ("exposure", "binning", "roi"):
+            self.settings.setValue(prefix + key, self.fields[key].value())
+        ids = self.settings.value("camera_ids", [], type=list)
+        if self.camera_id not in ids:
+            self.settings.setValue("camera_ids", ids + [self.camera_id])
+        self.settings.sync()
+
+    def _confirm_motion(self, description):
+        if not self.simulation and not self.geometry_check.isChecked():
+            self._warn("First validate the supported northern counterweight-down GEM geometry and driver pier interpretation.")
+            return False
+        pose = self.pose or {}
+        text = (description + f"\n\nCurrent pier: {pose.get('pier', 'unknown')}; tracking: {pose.get('tracking', 'unknown')}.\n"
+                "Targets are recomputed from current LST. Driver async slew and actual/destination pier states are checked.\n\n"
+                "Confirm driver limits remain enabled, guiding is stopped, and the complete path / possible meridian crossing is clear of collisions and cable snags. "
+                "Endpoint altitude checks do not prove a safe path. Keep native controls available. No software safety guarantee.")
+        return QtWidgets.QMessageBox.question(self, "Confirm motion and geometry", text,
+                    QtWidgets.QMessageBox.StandardButton.Yes | QtWidgets.QMessageBox.StandardButton.No,
+                    QtWidgets.QMessageBox.StandardButton.No) == QtWidgets.QMessageBox.StandardButton.Yes
+
+    def _plan_or_map(self, move):
+        try:
+            angles = self._angles()
+            cfg = self._config()
+            if move and not self._confirm_motion(f"Map explicit signed angles: {angles}\nPreferred Dec {cfg.dec:g}°, minimum altitude {cfg.min_alt:g}°. Feasible Dec may differ; inspect the plan first."):
+                return
+            self._save_profile()
+            self._launch("map" if move else "plan", angles=angles, confirmed=move,
+                         geometry_verified=self.geometry_check.isChecked())
+        except Exception as exc:
+            self._warn(str(exc))
+
+    def _measure(self):
+        if QtWidgets.QMessageBox.question(self, "Confirm RA measurement motion",
+                "Measurement stops tracking and drives RA through calibration and reversals. Stop guiding, confirm clearance and retain native controls. Continue?",
+                QtWidgets.QMessageBox.StandardButton.Yes | QtWidgets.QMessageBox.StandardButton.No,
+                QtWidgets.QMessageBox.StandardButton.No) != QtWidgets.QMessageBox.StandardButton.Yes:
+            return
+        self._save_profile()
+        self.trail.clear()
+        self.samples.clear()
+        self.calibration = None
+        self.last_result = None
+        self.bracket_item.setData([], [])
+        self._launch("measure")
+
+    def _selected_candidate(self):
+        index = self.table.currentRow()
+        if not 0 <= index < len(self.rows):
+            return None
+        row = self.rows[index]
+        if core.candidate([row]) is None:
+            return None
+        return row
+
+    def _return_candidate(self):
+        row = self._selected_candidate()
+        if not row or row.get("imported") or not row.get("pose"):
+            return
+        pose = row["pose"]
+        if self._confirm_motion(f"Return to selected valid measured candidate: requested angle {row['angle']:.3f}°, Dec {pose['dec']:.3f}°, expected pier {pose['pier']}.\n"
+                    "This MOVES the mount: slew, fresh star acquisition, calibration and RA reversal confirmation measurement, then a SECOND slew to the requested angle because measurement moves the axis.\n"
+                    "Only a saved quality-valid confirmation and verified final pose / tracking OFF permit stationary adjustment. Failed, uncertain or cancelled confirmation refuses adjustment. No automatic mesh changes; a low value is not a binding diagnosis."):
+            self._launch("slew_candidate", point_id=row["point_id"], confirmed=True,
+                         geometry_verified=self.geometry_check.isChecked())
+
+    def _refine(self):
+        row = self._selected_candidate()
+        if not row:
+            return
+        angle = finite(row.get("angle"))
+        angles = [round(angle + delta, 4) for delta in (-5, -2.5, 0, 2.5, 5)]
+        if any(a == 0 or abs(a) > 82 or a * angle <= 0 for a in angles):
+            self._warn("Refinement would cross zero or exceed ±82°. Enter a bounded explicit list instead.")
+            return
+        if self._confirm_motion(f"User-triggered refinement; explicit bounded list: {angles}. No inferred unsampled minimum."):
+            self._launch("map", angles=angles, confirmed=True, geometry_verified=self.geometry_check.isChecked())
+
+    def _finish_adjustment(self):
+        if QtWidgets.QMessageBox.question(self, "Enable tracking / movement?",
+                "Confirm all hands/tools are clear and motion may resume. This enables tracking only; no automatic slew. Reacquire and recalibrate for another measurement.",
+                QtWidgets.QMessageBox.StandardButton.Yes | QtWidgets.QMessageBox.StandardButton.No,
+                QtWidgets.QMessageBox.StandardButton.No) == QtWidgets.QMessageBox.StandardButton.Yes:
+            self._launch("finish_adjustment", confirmed=True)
+
+    def _stop(self):
+        self.worker.stop()
+        self.pending = True
+        self._on_state("stopping")
+        self._log("Stop requested; waiting for cooperative cleanup. No return slew. Use native controls if driver hangs.")
+
+    @QtCore.Slot(str)
+    def _on_state(self, state):
+        self.state = state
+        if state in {"preview", "awaiting_star"}:
+            self.pending = False
+        self.state_label.setText(state.replace("_", " ").upper())
+        if state == "adjustment":
+            self.banner.setText("ADJUSTMENT INTERLOCK · RA stopped / tracking OFF reported · No automatic motion · Motors may remain energized")
+        elif self.connected:
+            self.banner.setText("SIMULATION · Synthetic camera and mount · No hardware control" if self.simulation else
+                                "ASCOM HARDWARE · Single camera / single worker · Cooperative Stop only; keep native controls available")
+        self._gate()
+
+    @QtCore.Slot(str)
+    def _on_ready(self, state):
+        self.pending = False
+        self._on_state(state)
+
+    def _gate(self):
+        idle = self.connected and self.state in IDLE_STATES and not self.pending and not self.closing
+        free = not self.pending and not self.closing
+        selecting = idle or (self.state in {"preview", "awaiting_star"} and free)
+        self.connect_button.setEnabled(self.state == "disconnected" and free)
+        self.disconnect_button.setEnabled((self.state == "fault" or self.connected and self.state in IDLE_STATES | {"adjustment"}) and free)
+        self.settings_box.setEnabled((idle or self.state == "disconnected") and free)
+        self.advanced_box.setEnabled((idle or self.state == "disconnected") and free)
+        # Binning is a connection-time adapter setting, not a live mutation.
+        self.fields["binning"].setEnabled(self.state == "disconnected" and free)
+        for widget in (self.side, self.angle_list, self.geometry_check, self.fields["count"], self.fields["first"], self.fields["spacing"]):
+            widget.setEnabled(idle)
+        self.plan_button.setEnabled(idle)
+        self.map_button.setEnabled(idle and self.can_slew)
+        self.preview_button.setEnabled(idle)
+        self.live_button.setEnabled(idle)
+        self.auto_button.setEnabled(selecting)
+        self.measure_button.setEnabled(idle)
+        self.skip_button.setEnabled(self.state == "awaiting_star" and free)
+        self.stop_button.setEnabled(self.connected and (self.state in ACTIVE_STATES or self.pending) and not self.closing)
+        row = self._selected_candidate()
+        live = bool(row and not row.get("imported") and row.get("geometry_verified") and row.get("pose")
+                and row.get("connection") == self.current_connection)
+        self.candidate_button.setEnabled(idle and self.can_slew and live)
+        self.refine_button.setEnabled(idle and self.can_slew and bool(row))
+        self.finish_button.setEnabled(self.state == "adjustment" and free)
+        self.pose_button.setEnabled(idle)
+        self.import_button.setEnabled(self.state not in ACTIVE_STATES and free and self.state != "adjustment")
+        self.baseline_button.setEnabled(self.import_button.isEnabled())
+
+    @QtCore.Slot(object)
+    def _on_event(self, event):
+        kind = event["type"]
+        if kind == "connected":
+            self.connected = True
+            self.simulation = event["simulation"]
+            self.camera_id = event["camera"]
+            self.can_slew = event["can_slew"]
+            self.connected_binning = event["settings"]["binning"]
+            self.current_connection = event["connection"]
+            for key, value in event["settings"].items():
+                if key in self.fields:
+                    self.fields[key].setValue(value)
+            self._save_profile()
+            self.geometry_check.setChecked(self.simulation)
+            self.device_label.setText(f"{event['telescope']}\n{event['camera']}\n{event['width']} × {event['height']} binned pixels · bin {self.connected_binning}")
+            self._auto_range = True
+            self._log("Connected. No movement at connection. Driver capabilities validated by adapters.")
+        elif kind == "disconnected":
+            self.connected = False
+            self.current_connection = None
+            self.can_slew = False
+            self.pose = None
+            self.device_label.setText("No devices connected")
+            self.banner.setText("SIMULATION DEFAULT · No hardware connected · Imported measurements are offline only")
+        elif kind == "pose":
+            self.pose = event
+            self.pose_label.setText(f"RA {event['ra']:.4f} h · Dec {event['dec']:+.2f}° · HA {event['ha']:+.3f} h · "
+                                    f"angle {event['angle']:+.2f}° · alt {event['alt']:.1f}° · pier {event['pier']} · tracking {'ON' if event['tracking'] else 'OFF'}")
+        elif kind == "selected":
+            self.trail.clear()
+            self.trail_item.setData([], [])
+            self._log(f"Selected absolute binned coordinates: {event['position']}")
+        elif kind == "awaiting_star":
+            self.pending = False
+            self._log(f"No automatic star at {event['angle']:+g}°. Click full-frame image to retry this field, Auto-select to retry, or Skip. Pose is rechecked before measurement.")
+        elif kind == "phase":
+            self.state_label.setText(f"{self.state.upper()}  /  {event['phase']}  ·  {event['duration']:.1f} s")
+            self._log(f"Phase {event['phase']}: {event['duration']:.1f} s · raw rate {event['raw_rate']:+g}×")
+            if event["phase"] == "drift":
+                self.samples.clear()
+                self.trail.clear()
+                self.calibration = None
+                self.last_result = None
+                self.bracket_item.setData([], [])
+        elif kind == "calibration":
+            self.calibration = event
+            self._log(f"Drift {event['v0']:.3f} px/s · RA unit vector {event['u']} · driver sign {event['sign']:+g}")
+        elif kind == "sample":
+            self.samples.append((event["t"], event["x"], event["y"]))
+        self._gate()
+
+    @QtCore.Slot(object)
+    def _on_frame(self, frame):
+        image = frame.image
+        self.image_item.setImage(image, autoLevels=False)
+        # Robust display stretch is display-only, never applied to raw centroids.
+        sample = image[::max(1, image.shape[0] // 150), ::max(1, image.shape[1] // 150)]
+        lo, hi = np.percentile(sample, [5, 99.8])
+        self.image_item.setLevels((float(lo), float(max(lo + 50, hi))))
+        self.image_item.setRect(image_rect(frame.origin, image.shape, frame.step))
+        if self._auto_range:
+            self._fit_image()
+            self._auto_range = False
+        if math.isfinite(frame.x) and math.isfinite(frame.y):
+            self.trail.append((frame.x, frame.y))
+            xy = np.asarray(self.trail)
+            self.trail_item.setData(xy[:, 0], xy[:, 1])
+            self.star_item.setData([frame.x], [frame.y])
+            self._zoom(frame)
+            if self.calibration:
+                u = np.asarray(self.calibration["u"])
+                start = np.array([frame.x, frame.y])
+                end = start + 35 * u
+                self.direction_item.setData([start[0], end[0]], [start[1], end[1]])
+                if self.last_result:
+                    self._bracket(start, self.last_result)
+        q = frame.quality
+        self.quality_label.setText(f"Absolute binned sensor coordinates · SNR {finite(q.get('snr')):.1f} · FWHM {finite(q.get('fwhm')):.2f} px · "
+                                   f"saturated {q.get('saturated')} · Cyan observed / orange inferred B × v₀ / S")
+        if self.samples:
+            data = np.asarray(self.samples)
+            self.x_curve.setData(data[:, 0] - data[0, 0], data[:, 1])
+            self.y_curve.setData(data[:, 0] - data[0, 0], data[:, 2])
+
+    def _zoom(self, frame):
+        ix = int(round((frame.x - frame.origin[0]) / frame.step))
+        iy = int(round((frame.y - frame.origin[1]) / frame.step))
+        radius = max(4, int(32 / frame.step))
+        x0, y0 = max(0, ix - radius), max(0, iy - radius)
+        crop = frame.image[y0:iy + radius + 1, x0:ix + radius + 1]
+        if crop.size:
+            self.zoom_item.setImage(crop, autoLevels=True)
+            self.zoom_item.setRect(image_rect((frame.origin[0] + x0 * frame.step, frame.origin[1] + y0 * frame.step), crop.shape, frame.step))
+            self.zoom_plot.autoRange()
+
+    def _bracket(self, anchor, result):
+        length = backlash_pixels(result.get("backlash"), result.get("drift_px_s"))
+        u = np.asarray(result.get("u", [float("nan"), float("nan")]))
+        if not math.isfinite(length) or u.shape != (2,) or not np.isfinite(u).all():
+            self.bracket_item.setData([], [])
+            return
+        normal = np.array([-u[1], u[0]])
+        a = np.asarray(anchor) + normal * 24
+        b = a + u * length
+        points = np.array([a - normal * 4, a + normal * 4, a, b, b - normal * 4, b + normal * 4])
+        self.bracket_item.setData(points[:, 0], points[:, 1])
+
+    def _image_clicked(self, event):
+        if event.button() != QtCore.Qt.MouseButton.LeftButton or not self.image_plot.sceneBoundingRect().contains(event.scenePos()):
+            return
+        if not (self.connected and (self.state in IDLE_STATES or self.state in {"preview", "awaiting_star"}) and not self.pending):
+            return
+        point = self.image_plot.getViewBox().mapSceneToView(event.scenePos())
+        self._launch("select", position=(point.x(), point.y()))
+
+    def _fit_image(self):
+        self.image_plot.autoRange()
+
+    @QtCore.Slot(object)
+    def _on_result(self, result):
+        self.last_result = result
+        self._log(f"Result: B={finite(result.get('backlash')):.3f} RA-axis arcsec · {result.get('quality', 'unknown')} · "
+                  f"diagnostic allowance ±{finite(result.get('uncertainty_arcsec')):.3f} (NOT a calibrated confidence interval)")
+        raw = result.get("_raw", {})
+        frames = np.asarray(raw.get("frames", [])).reshape(-1, 3)
+        for item in self.fit_items:
+            self.time_plot.removeItem(item)
+        self.fit_items.clear()
+        if len(frames) and result.get("u") is not None and finite(result.get("drift_px_s")) > 0:
+            u = np.asarray(result["u"])
+            v0 = result["drift_px_s"]
+            t0 = frames[0, 0]
+            along = frames[:, 1:] @ u * core.S_ARCSEC / v0
+            orth = frames[:, 1:] @ np.array([-u[1], u[0]]) * core.S_ARCSEC / v0
+            self.x_curve.setData(frames[:, 0] - t0, along - along[0])
+            self.y_curve.setData(frames[:, 0] - t0, orth - orth[0])
+            self.time_plot.setLabel("left", "RA / orthogonal displacement", units="arcsec")
+            self.time_plot.setTitle("Command-timed RA-axis projection & orthogonal noise diagnostic (not seeing subtraction)")
+            for transition in raw.get("trans", []):
+                tc = transition["t"]
+                line = pg.InfiniteLine(tc - t0, pen=pg.mkPen("#5e6f80", style=QtCore.Qt.PenStyle.DotLine))
+                self.time_plot.addItem(line)
+                self.fit_items.append(line)
+                for key, color, start, end in (("fit_before", "#77d6a5", -1., 0.), ("fit_after", "#ffac59", 0., 1.)):
+                    slope, intercept = transition[key][:2]
+                    x = np.array([start, end])
+                    item = self.time_plot.plot(x + tc - t0, slope * x + intercept - along[0], pen=pg.mkPen(color, width=2))
+                    self.fit_items.append(item)
+            self._bracket(frames[-1, 1:], result)
+            self.calibration = dict(u=result["u"], v0=v0)
+        for note in result.get("notes", []):
+            self._log(str(note))
+
+    @QtCore.Slot(object)
+    def _on_rows(self, rows):
+        self.rows = [dict(row) for row in rows]
+        self.table.setRowCount(len(rows))
+        mismatches = 0
+        for index, row in enumerate(rows):
+            pose = row.get("pose", {})
+            reason = row.get("reason", "")
+            if row.get("role") == "candidate_confirmation":
+                reason = f"Candidate confirmation: {row.get('confirmation_status', 'measured')} · " + reason
+            if self.baseline and math.isfinite(finite(row.get("backlash"))):
+                matched = [b for b in self.baseline if abs(finite(b.get("angle")) - finite(row.get("angle"))) < .05
+                           and abs(finite(b.get("dec")) - finite(row.get("dec"))) < .05]
+                if matched:
+                    reason += f"  Δ baseline {finite(row.get('backlash')) - finite(matched[0].get('backlash')):+.3f} arcsec (load/settings not verified)"
+                else:
+                    reason += "  BASELINE POSE MISMATCH — no comparison"
+                    mismatches += 1
+            values = [row.get("angle"), row.get("ha", pose.get("ha")), row.get("dec"), row.get("alt", pose.get("alt")),
+                      f"{row.get('status', 'completed')} / {row.get('quality', '—')}", row.get("backlash"), row.get("uncertainty_arcsec"),
+                      row.get("fwd_rev"), row.get("rev_fwd"), row.get("n_good", "—"), reason]
+            for column, value in enumerate(values):
+                text = f"{value:.3f}" if isinstance(value, float) and math.isfinite(value) else "—" if value is None else str(value)
+                self.table.setItem(index, column, QtWidgets.QTableWidgetItem(text))
+        self.map_plot.clear()
+        # clear() does not consistently clear LegendItem across pg releases.
+        if self.map_plot.plotItem.legend:
+            self.map_plot.plotItem.legend.clear()
+        for source, color, name in ((rows, "#4bdce8", "Current"), (self.baseline, "#a4a3ec", "Saved baseline")):
+            usable = [r for r in source if math.isfinite(finite(r.get("angle"))) and math.isfinite(finite(r.get("backlash")))]
+            if usable:
+                x = np.array([float(r["angle"]) for r in usable])
+                y = np.array([float(r["backlash"]) for r in usable])
+                self.map_plot.plot(x, y, pen=None, symbol="o", symbolBrush=color, name=name)
+                for key, symbol in (("fwd_rev", "t"), ("rev_fwd", "s")):
+                    directional = np.array([finite(r.get(key)) for r in usable])
+                    present = np.isfinite(directional)
+                    # Scatter bounds use nanmin/nanmax, even for an entirely
+                    # missing series. Never send absent/nonfinite points.
+                    if present.any():
+                        self.map_plot.plot(x[present], directional[present], pen=None, symbol=symbol, symbolSize=6, symbolBrush=color)
+                err = np.array([finite(r.get("uncertainty_arcsec"), 0.) for r in usable])
+                self.map_plot.addItem(pg.ErrorBarItem(x=x, y=y, height=2 * err, beam=1.2, pen=color))
+        candidate = core.candidate(rows)
+        if candidate:
+            self._log(f"Qualified measured candidate {candidate['angle']:+g}° · {candidate['candidate_note']} · select table row to inspect/return")
+        if mismatches:
+            self._log(f"Warning: {mismatches} row(s) do not match saved baseline angle/Dec; comparison withheld.")
+        self._gate()
+
+    @staticmethod
+    def read_saved(path):
+        """Read legacy summary/JSON without inventing image or pose evidence."""
+        path = Path(path)
+        if path.suffix.lower() == ".csv":
+            with path.open(newline="", encoding="utf-8-sig") as stream:
+                data = list(csv.DictReader(stream))
+            rows = []
+            for entry in data:
+                row = dict(entry)
+                for key in ("angle", "dec", "backlash", "spread", "fwd_rev", "rev_fwd", "uncertainty_arcsec"):
+                    row[key] = finite(row.get(key))
+                row.setdefault("quality", "uncertain")
+                rows.append(row)
+        else:
+            data = core.load_result(path)
+            rows = data.get("rows", [data])
+            if not isinstance(rows, list) or not all(isinstance(row, dict) for row in rows):
+                raise ValueError("Expected result object or manifest rows")
+        result = []
+        for source in rows:
+            row = dict(source)
+            metadata = row.get("metadata", {})
+            for key in ("angle", "dec", "pose"):
+                if key not in row and key in metadata:
+                    row[key] = metadata[key]
+            # Imports NEVER acquire this connection's motion authorization.
+            row.update(imported=True, geometry_verified=False, connection=None)
+            result.append(row)
+        return result
+
+    def _import(self, baseline):
+        path, _ = QtWidgets.QFileDialog.getOpenFileName(self, "Select saved baseline" if baseline else "Import offline results", "", "Saved results (*.json *.csv)")
+        if not path:
+            return
+        try:
+            rows = self.read_saved(path)
+            if baseline:
+                self.baseline = rows
+                self._on_rows(self.rows)
+            else:
+                self.last_result = None
+                self.trail.clear()
+                self.image_item.clear()
+                self.zoom_item.clear()
+                for item in (self.trail_item, self.star_item, self.bracket_item, self.direction_item, self.x_curve, self.y_curve):
+                    item.setData([], [])
+                for item in self.fit_items:
+                    self.time_plot.removeItem(item)
+                self.fit_items.clear()
+                self._on_rows(rows)
+            self._log(f"Loaded {len(rows)} saved row(s). Offline data: no camera images reconstructed; imported results cannot authorize candidate return.")
+        except Exception as exc:
+            self._warn(f"Cannot load saved results: {exc}")
+
+    def _log(self, message):
+        self.log_view.appendPlainText(time.strftime("%H:%M:%S  ") + message)
+
+    def _warn(self, message):
+        self._log("Warning: " + message)
+        QtWidgets.QMessageBox.warning(self, "RA Backlash", message)
+
+    def closeEvent(self, event):
+        if not self.worker.isRunning():
+            event.accept()
+            return
+        event.ignore()
+        if not self.closing:
+            self.closing = True
+            self._log("Closing: requesting cancellation and owner-thread disconnect. Waiting for driver; never terminating QThread.")
+            self.worker.shutdown()
+            self._gate()
+
+    def _worker_finished(self):
+        if self.closing:
+            self.close()
+        else:
+            self.pending = False
+            self.connected = False
+            self._on_state("fault")
+
+
+def main(argv=None):
+    app = QtWidgets.QApplication.instance() or QtWidgets.QApplication(sys.argv if argv is None else argv)
+    app.setApplicationName("RA Backlash")
+    app.setOrganizationName("RA Backlash")
+    pg.setConfigOptions(antialias=True, background="#111e29", foreground="#adc3d6", imageAxisOrder="row-major")
+    window = MainWindow()
+    window.show()
+    return app.exec()
