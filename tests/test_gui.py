@@ -14,7 +14,7 @@ pytest.importorskip("pyqtgraph")
 from PySide6 import QtCore, QtWidgets
 
 from ra_backlash_app import core, devices
-from ra_backlash_app.gui import DeviceWorker, MainWindow, backlash_pixels, image_rect
+from ra_backlash_app.gui import DeviceWorker, FrameSnapshot, MainWindow, backlash_pixels, image_rect
 
 
 @pytest.fixture(scope="module")
@@ -680,3 +680,293 @@ def test_stop_queued_during_state_publication_blocks_new_motion(safety_worker, a
     assert rejected == [True]
     assert ready[-1] == "idle", logs
     assert mount.on is False
+
+
+def legend_names(plot):
+    return [label.text for _, label in plot.plotItem.legend.items]
+
+
+def phase_event(window, name):
+    window._on_event(dict(type="phase", phase=name, duration=4., raw_rate=0.))
+
+
+def sample_event(window, t, x, y):
+    window._on_event(dict(type="sample", t=t, x=x, y=y))
+
+
+def completed_display_result():
+    return dict(backlash=12., uncertainty_arcsec=1.5, quality="uncertain",
+                notes=["Directional disagreement; repeat measurement."],
+                u=[.6, .8], drift_px_s=2 * core.S_ARCSEC,
+                _raw=dict(frames=[[10., 100., 200.], [11., 103., 204.], [12., 106., 208.]],
+                          cmds=[(10., 0.), (11., 1.)],
+                          trans=[dict(t=11., fit_before=[2., 112., .1], fit_after=[3., 114., .1])]))
+
+
+def preview_snapshot(x=120., y=220., quality=None):
+    return FrameSnapshot(np.ones((32, 32)), (100, 200), 1, 25., x, y, quality)
+
+
+def test_connected_guidance_is_persistent_without_launching_work(window, monkeypatch):
+    launches = []
+    monkeypatch.setattr(window.worker, "submit", lambda *a, **k: launches.append((a, k)))
+    window._on_event(dict(type="connected", simulation=True, camera="simulator", telescope="simulator",
+                          can_slew=True, settings={"binning": 1}, connection="test", width=100, height=100))
+    window._on_ready("idle")
+    assert not launches
+    guidance = window.guidance_label.text()
+    for text in ("1 Full frame", "2 Auto-select or click an isolated star", "3 Measure here",
+                 "auto-selects if no choice", "one point", "multiple signed angles", "fast virtual time"):
+        assert text in guidance
+    for button in (window.connect_button, window.preview_button, window.live_button,
+                   window.auto_button, window.measure_button, window.map_button, window.plan_button):
+        assert button.toolTip()
+
+
+@pytest.mark.parametrize("state,expected", [
+    ("preview", "Preview exposure"), ("acquiring", "reacquiring"),
+    ("awaiting_star", "Skip field"), ("completed", "diagnostic allowance"),
+    ("fault", "disconnect"), ("adjustment", "Clear hands/tools"),
+    ("disconnected", "no exposures"), ("stopping", "cooperative cleanup"),
+])
+def test_guidance_states(window, state, expected):
+    window._on_ready(state)
+    assert expected in window.guidance_label.text()
+    assert "1 Full frame" in window.guidance_label.text()
+
+
+@pytest.mark.parametrize("phase,expected", [
+    ("drift", "Drift calibration"), ("sign", "Drive direction check"),
+    ("sign_settle", "Drive direction check"), ("latency_fast", "Drive response delay"),
+    ("latency_slow", "Drive response delay"), ("reverse_1", "Reverse drive"),
+    ("forward_1", "Forward drive"),
+])
+def test_plain_language_phase_guidance(window, phase, expected):
+    phase_event(window, phase)
+    assert expected in window.guidance_label.text()
+    assert expected.upper() in window.state_label.text()
+    assert "phases may flash" in window.guidance_label.text()
+
+
+def test_selected_and_disconnect_guidance(window):
+    window._on_event(dict(type="selected", position=(12., 13.)))
+    assert "Star selected" in window.guidance_label.text()
+    window._on_event(dict(type="selected", position=None))
+    assert "No suitable star" in window.guidance_label.text()
+    window._on_event(dict(type="disconnected"))
+    assert "Disconnected" in window.guidance_label.text()
+    assert "No automatic exposures" in window.guidance_label.text()
+
+
+def test_image_legend_survives_quality_and_result_updates(window):
+    legend = window.image_legend_label.text()
+    for text in ("Cyan line", "White cross", "Gray dashed", "Orange bracket", "completed fit only", "seeing removal"):
+        assert text in legend
+    assert 'style="color:' in legend
+    phase_event(window, "drift")
+    window._on_frame(preview_snapshot(quality={"snr": 25., "fwhm": 3., "saturated": False}))
+    assert "25.0" in window.quality_label.text()
+    bracket = window.bracket_item.getData()[0]
+    assert bracket is None or not bracket.size
+    window._on_result(completed_display_result())
+    assert window.bracket_item.getData()[0].size
+    window._on_frame(preview_snapshot(quality={"snr": 40.}))
+    assert "40.0" in window.quality_label.text()
+    assert window.image_legend_label.text() == legend
+    assert "12.000 ± 1.500" in window.result_summary.text()
+    assert "Quality: uncertain" in window.result_summary.text()
+    assert "Directional disagreement" in window.result_summary.text()
+
+
+def test_live_trajectory_projects_all_samples_and_updates_without_frame(window):
+    phase_event(window, "drift")
+    sample_event(window, 10., 100., 200.)
+    sample_event(window, 11., 103., 204.)
+    np.testing.assert_allclose(window.x_curve.getData(), [[0., 1.], [0., 3.]])
+    np.testing.assert_allclose(window.y_curve.getData()[1], [0., 4.])
+    assert window.time_plot.getAxis("left").labelUnits == "px"
+    assert legend_names(window.time_plot)[:2] == ["Sensor x displacement (cyan)", "Sensor y displacement (purple)"]
+    window._on_event(dict(type="calibration", u=[.6, .8], v0=2 * core.S_ARCSEC, sign=1.))
+    np.testing.assert_allclose(window.x_curve.getData()[1], [0., 2.5])
+    np.testing.assert_allclose(window.y_curve.getData()[1], [0., 0.], atol=1e-14)
+    sample_event(window, 12., 106., 208.)
+    np.testing.assert_allclose(window.x_curve.getData()[1], [0., 2.5, 5.])
+    assert window.time_plot.getAxis("left").labelUnits == "arcsec"
+    assert "RA-axis-equivalent" in window.time_plot.getAxis("left").labelText
+    assert "first valid sample" in window.time_plot.getAxis("bottom").labelText
+    assert legend_names(window.time_plot)[:2] == ["RA displacement (cyan)", "Orthogonal displacement (purple)"]
+    assert "NOT backlash alone" in window.trajectory_caption.text()
+    assert "seeing removal" in window.trajectory_caption.text()
+
+
+def test_completed_and_live_use_same_origin_units_and_preview_preserves_fits(window):
+    result = completed_display_result()
+    phase_event(window, "drift")
+    for t, x, y in result["_raw"]["frames"]:
+        sample_event(window, t, x, y)
+    window._on_event(dict(type="calibration", u=result["u"], v0=result["drift_px_s"], sign=1.))
+    live = [np.array(values) for values in window.x_curve.getData()]
+    window._on_result(result)
+    np.testing.assert_allclose(window.x_curve.getData(), live)
+    # Absolute fit intercepts use exactly the same projected origin (110).
+    np.testing.assert_allclose(window.fit_items[-2].getData(), [[0., 1.], [0., 2.]])
+    np.testing.assert_allclose(window.fit_items[-1].getData(), [[1., 2.], [4., 7.]])
+    fits = list(window.fit_items)
+    bracket = [a.copy() for a in window.bracket_item.getData()]
+    window._on_ready("completed")
+    window._on_state("preview")
+    window._on_frame(preview_snapshot())
+    np.testing.assert_allclose(window.x_curve.getData(), live)
+    np.testing.assert_allclose(window.bracket_item.getData(), bracket)
+    assert window.fit_items == fits
+    assert window.time_plot.getAxis("left").labelUnits == "arcsec"
+    assert len(legend_names(window.time_plot)) == 5
+    assert window._before_sample.scene() is None  # Legend sample is not fake plotted data.
+    assert window._after_sample.scene() is None
+    assert len(window.time_plot.listDataItems()) == 4  # Two trajectories and two real fits.
+    assert "image's inferred-backlash bracket" in window.trajectory_caption.text()
+
+
+@pytest.mark.parametrize("workflow", ["repeat", "map point", "candidate confirmation"])
+def test_each_actual_drift_resets_all_completed_display_state(window, workflow):
+    for _ in range(3):
+        window._on_result(completed_display_result())
+        assert len(legend_names(window.time_plot)) == 5
+        window._on_state("acquiring")  # Keep old result until actual measurement starts.
+        assert window.last_result is not None, workflow
+        phase_event(window, "drift")
+        assert not window.samples and not window.trail
+        assert window.calibration is None and window.last_result is None
+        assert not window.fit_items
+        for item in (window.trail_item, window.star_item, window.direction_item, window.bracket_item,
+                     window.x_curve, window.y_curve):
+            data = item.getData()[0]
+            assert data is None or not len(data)
+        assert window.time_plot.getAxis("left").labelUnits == "px"
+        assert "Raw sensor displacement" in window.time_plot.plotItem.titleLabel.text
+        assert "No completed fit yet" in window.result_summary.text()
+        assert len(legend_names(window.time_plot)) == 2
+        assert len(window.time_plot.listDataItems()) == 2
+
+
+@pytest.mark.parametrize("accepted", [True, False])
+def test_measure_submission_does_not_erase_completed_plot(window, monkeypatch, accepted):
+    window._on_result(completed_display_result())
+    result = window.last_result
+    monkeypatch.setattr(QtWidgets.QMessageBox, "question", lambda *a, **k: QtWidgets.QMessageBox.StandardButton.Yes)
+    monkeypatch.setattr(window.worker, "submit", lambda *a, **k: accepted)
+    window._measure()
+    assert window.last_result is result
+    assert window.fit_items
+    if accepted:
+        assert window.tabs.currentWidget() is window.trajectory_panel
+
+
+def test_completed_image_uses_full_recorded_path_and_refits(window, monkeypatch):
+    fitted = []
+    monkeypatch.setattr(window, "_fit_image", lambda: fitted.append(True))
+    result = completed_display_result()
+    window._on_result(result)
+    recorded = np.asarray(result["_raw"]["frames"])
+    x, y = window.trail_item.getData()
+    np.testing.assert_allclose(x, recorded[:, 1])
+    np.testing.assert_allclose(y, recorded[:, 2])
+    assert fitted == [True]
+    assert window.time_plot.minimumHeight() >= 220
+    assert window.time_plot.plotItem.legend.columnCount == 2
+
+
+def test_missing_partial_samples_leave_gaps_and_use_first_valid_origin(window):
+    phase_event(window, "drift")
+    sample_event(window, 8., None, None)
+    sample_event(window, 10., 100., 200.)
+    sample_event(window, 11., 103., None)
+    sample_event(window, 12., 106., 208.)
+    window._on_event(dict(type="calibration", u=[.6, .8], v0=2 * core.S_ARCSEC, sign=1.))
+    times, values = window.x_curve.getData()
+    np.testing.assert_allclose(times, [-2., 0., 1., 2.])
+    np.testing.assert_allclose(values, [np.nan, 0., np.nan, 5.], equal_nan=True)
+    assert window.x_curve.opts["connect"] == "finite"
+    assert window.y_curve.opts["connect"] == "finite"
+    window._on_frame(preview_snapshot(x=None, y=None))
+    window._on_frame(preview_snapshot(x=120., y=None))
+    window.time_plot.autoRange()
+
+
+@pytest.mark.parametrize("frames,u,v0", [
+    ([], None, None), ([[None, None, None]], [.6, .8], 30.),
+    ([[10., 100.], [11., None, 200.]], [1.], 0.),
+    ([[9., None, 200.], [10., 100., 200.], [11., None, None], [12., 106., 208.]], [.6, .8], 2 * core.S_ARCSEC),
+])
+def test_partial_results_never_crash_or_invent_fits(window, frames, u, v0):
+    window._on_result(dict(_raw={"frames": frames, "trans": [{"t": None}, {"t": 11., "fit_before": None}]},
+                           u=u, drift_px_s=v0, status="failed", quality="invalid", reason="Selected star lost"))
+    assert "Selected star lost" in window.result_summary.text()
+    assert not window._has_fits
+    data = window.bracket_item.getData()[0]
+    assert data is None or not len(data)
+    window.time_plot.autoRange()
+
+
+def test_map_direction_names_captions_and_scatter_only(window):
+    assert "Run Start map" in window.map_caption.text()
+    assert "Measure here produces one point, no full map" in window.map_caption.text()
+    rows = [dict(angle=25., backlash=12., fwd_rev=11., rev_fwd=13., uncertainty_arcsec=1.)]
+    window.baseline = [dict(rows[0], angle=-25.)]
+    for _ in range(3):
+        window._on_rows(rows)
+        names = legend_names(window.map_plot)
+        assert len(names) == len(set(names)) == 6
+        for source in ("Current (cyan)", "Saved baseline (purple)"):
+            assert source + " · median (circle)" in names
+            assert source + " · forward → reverse (triangle)" in names
+            assert source + " · reverse → forward (square)" in names
+        for item in window.map_plot.listDataItems():
+            assert item.opts["pen"] is None
+    assert "NOT a confidence interval" in window.map_caption.text()
+    assert "no connections across unknown samples or pier sides" in window.map_caption.text()
+
+
+def test_tabs_follow_measure_and_map_but_not_plan_or_preview(window, monkeypatch):
+    monkeypatch.setattr(window.worker, "submit", lambda *a, **k: True)
+    window.tabs.setCurrentWidget(window.table)
+    window._launch("plan")
+    assert window.tabs.currentWidget() is window.table
+    window._launch("map")
+    assert window.tabs.currentWidget() is window.map_panel
+    window._launch("preview")
+    assert window.tabs.currentWidget() is window.map_panel
+    window._launch("measure")
+    assert window.tabs.currentWidget() is window.trajectory_panel
+
+
+def test_real_simulator_signals_complete_then_preview_without_reverting(window, app, tmp_path):
+    ready, frames, results, phases = [], [], [], []
+    window.worker.ready.connect(ready.append)
+    window.worker.frame.connect(frames.append)
+    window.worker.result.connect(results.append)
+    window.worker.event.connect(lambda event: phases.append(event["phase"]) if event["type"] == "phase" else None)
+    cfg = core.Config(out=str(tmp_path), sim_backlash=12.)
+    window.worker.start()
+    try:
+        assert window._launch("connect", cfg=cfg, simulation=True)
+        until(app, lambda: len(ready) == 1)
+        assert not frames and not results  # Connecting itself never exposes.
+        assert "1 Full frame" in window.guidance_label.text()
+        assert window._launch("measure", cfg=cfg)
+        until(app, lambda: len(ready) == 2, 60)
+        assert ready[-1] == "completed"
+        assert phases[0] == "drift"
+        assert f"B = {results[-1]['backlash']:.3f}" in window.result_summary.text()
+        assert len(legend_names(window.time_plot)) == 5
+        data = [a.copy() for a in window.x_curve.getData()]
+        fits = list(window.fit_items)
+        assert window._launch("preview", cfg=cfg, continuous=False)
+        until(app, lambda: len(ready) == 3)
+        np.testing.assert_allclose(window.x_curve.getData(), data)
+        assert window.fit_items == fits
+        assert window.time_plot.getAxis("left").labelUnits == "arcsec"
+    finally:
+        window.worker.shutdown()
+        assert window.worker.wait(10000)
+        app.processEvents()

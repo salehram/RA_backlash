@@ -7,6 +7,7 @@ from __future__ import annotations
 
 import csv
 import hashlib
+import html
 import math
 import os
 import queue
@@ -751,6 +752,8 @@ class MainWindow(QtWidgets.QMainWindow):
         self.trail = deque(maxlen=2000)
         self.samples = deque(maxlen=12000)
         self.calibration = None
+        self.selected_position = None
+        self._phase_description = ""
         self._auto_range = True
         self._build_ui()
         self.setStyleSheet(DARK_STYLE)
@@ -766,6 +769,7 @@ class MainWindow(QtWidgets.QMainWindow):
         if start_worker:
             self.worker.start()
         self._gate()
+        self._update_guidance()
         self._log("Simulator selected by default. Software Stop cannot interrupt a hung driver; keep native mount controls available.")
 
     def _build_ui(self):
@@ -784,6 +788,10 @@ class MainWindow(QtWidgets.QMainWindow):
         self.banner.setObjectName("banner")
         self.banner.setWordWrap(True)
         layout.addWidget(self.banner)
+        self.guidance_label = QtWidgets.QLabel()
+        self.guidance_label.setWordWrap(True)
+        self.guidance_label.setObjectName("banner")
+        layout.addWidget(self.guidance_label)
         split = QtWidgets.QSplitter()
         layout.addWidget(split, 1)
         sidebar_scroll = QtWidgets.QScrollArea()
@@ -885,24 +893,59 @@ class MainWindow(QtWidgets.QMainWindow):
         views.addWidget(self.zoom_plot)
         views.setSizes([850, 230])
         image_layout.addWidget(views, 1)
-        self.quality_label = QtWidgets.QLabel("Cyan: observed centroid trail   ·   Orange: separately anchored inferred B × v₀ / S   ·   No calibrated confidence intervals")
+        self.image_legend_label = QtWidgets.QLabel(
+            '<b>Image key:</b> <span style="color:#47dfed">Cyan line: observed star path</span> · '
+            '<span style="color:#e9f4ff">White cross: selected star</span> · '
+            '<span style="color:#92a7bc">Gray dashed line: calibrated RA direction</span> · '
+            '<span style="color:#ffac59">Orange bracket: inferred backlash, completed fit only</span>. '
+            'Bracket is not extra observed movement or seeing removal.')
+        self.image_legend_label.setWordWrap(True)
+        image_layout.addWidget(self.image_legend_label)
+        self.quality_label = QtWidgets.QLabel("Star quality appears after acquisition · absolute binned sensor coordinates")
         self.quality_label.setWordWrap(True)
         image_layout.addWidget(self.quality_label)
         center.addWidget(image_panel)
-        tabs = QtWidgets.QTabWidget()
+        self.tabs = tabs = QtWidgets.QTabWidget()
         self.time_plot = pg.PlotWidget(title="Raw sensor coordinates vs time · calibration required for RA projection")
-        self.time_plot.addLegend()
-        self.time_plot.setLabel("bottom", "Elapsed", units="s")
-        self.time_plot.setLabel("left", "Position", units="px")
-        self.x_curve = self.time_plot.plot(pen="#48dfea", name="x / RA-axis position")
-        self.y_curve = self.time_plot.plot(pen="#9a9eea", name="y / orthogonal diagnostic")
+        self.time_plot.setMinimumHeight(220)
+        self.time_plot.addLegend(colCount=2, brush=pg.mkBrush("#172633"),
+                     pen=pg.mkPen("#40596c"), labelTextColor="#dbe5ef")
+        self.time_plot.setLabel("bottom", "Time from first valid sample", units="s")
+        self.x_curve = self.time_plot.plot(pen="#48dfea", symbol="o", symbolSize=3, connect="finite")
+        self.y_curve = self.time_plot.plot(pen="#9a9eea", symbol="o", symbolSize=3, connect="finite")
         self.fit_items = []
-        tabs.addTab(self.time_plot, "Trajectory & transitions")
+        self._command_sample = pg.PlotDataItem(pen=pg.mkPen("#92a7bc", style=QtCore.Qt.PenStyle.DotLine))
+        self._before_sample = pg.PlotDataItem(pen=pg.mkPen("#77d6a5", width=2))
+        self._after_sample = pg.PlotDataItem(pen=pg.mkPen("#ffac59", width=2))
+        self._trajectory_legend_names = []
+        self._has_commands = self._has_fits = False
+        self._pending_phase = False
+        self.trajectory_caption = QtWidgets.QLabel()
+        self.trajectory_caption.setWordWrap(True)
+        self.result_summary = QtWidgets.QLabel()
+        self.result_summary.setWordWrap(True)
+        self.result_summary.setTextFormat(QtCore.Qt.TextFormat.PlainText)
+        self.trajectory_panel = QtWidgets.QWidget()
+        trajectory_layout = QtWidgets.QVBoxLayout(self.trajectory_panel)
+        trajectory_layout.addWidget(self.result_summary)
+        trajectory_layout.addWidget(self.time_plot, 1)
+        trajectory_layout.addWidget(self.trajectory_caption)
+        tabs.addTab(self.trajectory_panel, "Trajectory & transitions")
         self.map_plot = pg.PlotWidget(title="Measured backlash · diagnostic allowances, not confidence intervals")
         self.map_plot.setLabel("bottom", "Signed mechanical angle (not pier side)", units="°")
         self.map_plot.setLabel("left", "RA-axis backlash", units="arcsec")
-        self.map_plot.addLegend()
-        tabs.addTab(self.map_plot, "Map & baseline")
+        self.map_plot.setMinimumHeight(220)
+        self.map_plot.addLegend(colCount=2, brush=pg.mkBrush("#172633"),
+                    pen=pg.mkPen("#40596c"), labelTextColor="#dbe5ef")
+        self.map_caption = QtWidgets.QLabel()
+        self.map_caption.setWordWrap(True)
+        self.map_panel = QtWidgets.QWidget()
+        map_layout = QtWidgets.QVBoxLayout(self.map_panel)
+        map_layout.addWidget(self.map_plot, 1)
+        map_layout.addWidget(self.map_caption)
+        tabs.addTab(self.map_panel, "Map & baseline")
+        self._update_map_caption()
+        self._reset_measurement_display()
         self.table = QtWidgets.QTableWidget(0, 11)
         self.table.setHorizontalHeaderLabels(["Angle °", "HA h", "Dec °", "Alt °", "State / quality", "B arcsec", "Diagnostic ±", "Fwd → rev", "Rev → fwd", "N", "Reason / comparison"])
         self.table.setAlternatingRowColors(True)
@@ -914,7 +957,7 @@ class MainWindow(QtWidgets.QMainWindow):
         self.table.itemSelectionChanged.connect(self._gate)
         tabs.addTab(self.table, "Plan & measurements")
         center.addWidget(tabs)
-        center.setSizes([490, 260])
+        center.setSizes([340, 370])
         footer = QtWidgets.QHBoxLayout()
         self.import_button = self._button("Import saved results…", lambda: self._import(False), footer)
         self.baseline_button = self._button("Select saved baseline…", lambda: self._import(True), footer)
@@ -927,7 +970,7 @@ class MainWindow(QtWidgets.QMainWindow):
         self.log_view = QtWidgets.QPlainTextEdit()
         self.log_view.setReadOnly(True)
         self.log_view.setMaximumBlockCount(1500)
-        self.log_view.setMaximumHeight(105)
+        self.log_view.setMaximumHeight(80)
         layout.addWidget(self.log_view)
         self.pose_label = QtWidgets.QLabel("No pose · Stop is not a hardware emergency stop")
         self.statusBar().addWidget(self.pose_label, 1)
@@ -935,6 +978,18 @@ class MainWindow(QtWidgets.QMainWindow):
         refresh.clicked.connect(lambda: self._launch("pose"))
         self.pose_button = refresh
         self.statusBar().addPermanentWidget(refresh)
+        for button, tip in (
+            (self.connect_button, "Connect only: no exposure or mount motion starts automatically."),
+            (self.preview_button, "1 · Take one full-frame image to find an isolated star. No RA drive."),
+            (self.live_button, "Repeat preview exposures until Stop. Stop preview before measuring."),
+            (self.auto_button, "2 · Acquire an isolated star automatically, or click one in the image."),
+            (self.measure_button, "3 · Measure one point here with calibration and RA reversals. Auto-selects if no star chosen; asks before motion."),
+            (self.map_button, "Measure multiple signed angles with slews and fresh calibration at each point; asks before motion."),
+            (self.plan_button, "Show feasible targets in the table without slewing or exposing."),
+            (self.stop_button, "Request cooperative stop. A hung driver may require native mount controls."),
+            (self.skip_button, "Skip this map field; do not measure an unselected star."),
+        ):
+            button.setToolTip(tip)
 
     def _button(self, text, callback, layout):
         button = QtWidgets.QPushButton(text)
@@ -971,6 +1026,8 @@ class MainWindow(QtWidgets.QMainWindow):
             if name not in {"connect", "disconnect", "finish_adjustment", "skip", "pose"}:
                 payload.setdefault("cfg", self._config())
             accepted = self.worker.submit(name, **payload)
+            if accepted and name in {"measure", "slew_candidate", "map"}:
+                self.tabs.setCurrentWidget(self.map_panel if name == "map" else self.trajectory_panel)
             if accepted and self.connected and name not in {"connect", "skip", "pose"}:
                 self._save_profile()
             if accepted and not (self.state in {"preview", "awaiting_star"} and name in {"select", "auto_select", "skip"}):
@@ -1043,11 +1100,6 @@ class MainWindow(QtWidgets.QMainWindow):
                 QtWidgets.QMessageBox.StandardButton.No) != QtWidgets.QMessageBox.StandardButton.Yes:
             return
         self._save_profile()
-        self.trail.clear()
-        self.samples.clear()
-        self.calibration = None
-        self.last_result = None
-        self.bracket_item.setData([], [])
         self._launch("measure")
 
     def _selected_candidate(self):
@@ -1098,6 +1150,7 @@ class MainWindow(QtWidgets.QMainWindow):
     @QtCore.Slot(str)
     def _on_state(self, state):
         self.state = state
+        self._phase_description = ""
         if state in {"preview", "awaiting_star"}:
             self.pending = False
         self.state_label.setText(state.replace("_", " ").upper())
@@ -1106,7 +1159,124 @@ class MainWindow(QtWidgets.QMainWindow):
         elif self.connected:
             self.banner.setText("SIMULATION · Synthetic camera and mount · No hardware control" if self.simulation else
                                 "ASCOM HARDWARE · Single camera / single worker · Cooperative Stop only; keep native controls available")
+        self._update_guidance()
         self._gate()
+
+    def _update_guidance(self, message=None):
+        if message is None:
+            message = {
+                "disconnected": "Connect devices to begin. Connection alone takes no exposures and starts no mount motion.",
+                "connecting": "Connecting only — no automatic exposures or mount motion.",
+                "idle": ("Star selected — Measure here is ready." if self.selected_position is not None else
+                         "Ready — take a Full frame, then choose a star or let Measure here auto-select."),
+                "preview": "Preview exposure — Auto-select or click an isolated star. Stop Live preview before Measure here.",
+                "acquiring": "Finding / reacquiring the selected star before measurement; wait for acquisition.",
+                "awaiting_star": "No suitable star — click an isolated star, Auto-select to retry, or Skip field.",
+                "calibrating": "Calibrating camera direction and drive response; wait or Stop.",
+                "measuring": "Measuring RA reversals; wait for the fitted result or Stop.",
+                "analyzing": "Fitting the recorded trajectory and checking measurement quality.",
+                "completed": "Completed — inspect B ± diagnostic allowance and quality reasons in Trajectory; map points appear in Map & baseline.",
+                "fault": "Fault — use native controls if needed. Inspect the log, disconnect, then reconnect before retrying.",
+                "adjustment": "Adjustment interlock — RA stopped / tracking OFF reported. Clear hands/tools before Finish adjustment; reacquire for a new measurement.",
+                "stopping": "Stopping — waiting for cooperative cleanup, not returning the mount. Use native controls if a driver hangs.",
+                "slewing": "Moving to a requested map / candidate angle; wait or Stop. Keep native controls available.",
+                "settling": "Waiting for the mount to settle before selecting a star.",
+            }.get(self.state, "Wait for the current operation or Stop.")
+        timing = " Simulation uses fast virtual time; phases may flash by." if self.simulation else ""
+        self.guidance_label.setText(
+            "<b>Next:</b> " + html.escape(message + timing) +
+            "<br><b>1 Full frame</b> → <b>2 Auto-select or click an isolated star</b> → "
+            "<b>3 Measure here</b> (auto-selects if no choice). "
+            "Measure here = one point; <b>Start map</b> = multiple signed angles. Measurement asks before RA motion.")
+
+    def _reset_measurement_display(self):
+        """Display-only reset at actual drift start, including map/confirmation points."""
+        self.samples.clear()
+        self.trail.clear()
+        self.calibration = None
+        self.last_result = None
+        self._pending_phase = False
+        self._has_commands = self._has_fits = False
+        for item in self.fit_items:
+            self.time_plot.removeItem(item)
+        self.fit_items.clear()
+        for item in (self.trail_item, self.star_item, self.direction_item, self.bracket_item,
+                     self.x_curve, self.y_curve):
+            item.setData([], [])
+        self.result_summary.setText("No completed fit yet — B and quality reasons will appear here.")
+        self._update_trajectory()
+
+    def _trajectory_calibration(self):
+        calibration = self.calibration or {}
+        try:
+            u = np.asarray(calibration.get("u", []), dtype=float)
+        except (TypeError, ValueError):
+            return None
+        v0 = finite(calibration.get("v0"))
+        if (u.shape == (2,) and np.isfinite(u).all() and
+                abs(np.linalg.norm(u) - 1) < .001 and v0 > 0):
+            return u, v0
+        return None
+
+    def _update_trajectory(self):
+        """One origin/unit system for live samples and completed raw frames; retain gaps."""
+        calibrated = self._trajectory_calibration()
+        names = (["RA displacement (cyan)", "Orthogonal displacement (purple)"] if calibrated else
+                 ["Sensor x displacement (cyan)", "Sensor y displacement (purple)"])
+        entries = [(self.x_curve, names[0]), (self.y_curve, names[1])]
+        if self._has_commands:
+            entries.append((self._command_sample, "Command / phase time (gray dotted)"))
+        if self._has_fits:
+            entries.extend([(self._before_sample, "Fit before command (green)"),
+                            (self._after_sample, "Fit after command (orange)")])
+        labels = [name for _, name in entries]
+        if labels != self._trajectory_legend_names:
+            legend = self.time_plot.plotItem.legend
+            legend.clear()
+            for item, name in entries:
+                legend.addItem(item, name)
+            self._trajectory_legend_names = labels
+        self.time_plot.setLabel("left", "RA / orthogonal displacement (RA-axis-equivalent)" if calibrated else
+                                "Sensor x / y displacement", units="arcsec" if calibrated else "px")
+        self.time_plot.setTitle("Calibrated RA-axis trajectory · relative to first valid sample" if calibrated else
+                               "Raw sensor displacement · awaiting drift calibration")
+        self.trajectory_caption.setText(
+            ("Calibrated: RA + orthogonal displacement in RA-axis-equivalent arcsec, both relative to the first valid sample. " if calibrated else
+             "Before calibration: sensor x + y displacement in pixels, relative to the first valid sample. ") +
+            "Observed star displacement includes intentional drives — it is NOT backlash alone or seeing removal. "
+            "Gray dotted = command / phase time (live: first sample); green = fit before, orange = fit after command. "
+            "Orange trajectory fit is NOT the image's inferred-backlash bracket. Missing samples leave gaps.")
+        data = np.asarray(self.samples, dtype=float).reshape(-1, 3)
+        valid = np.isfinite(data).all(axis=1)
+        if not valid.any():
+            self.x_curve.setData([], [])
+            self.y_curve.setData([], [])
+            return None
+        origin = data[np.flatnonzero(valid)[0]]
+        xy = data[:, 1:] - origin[1:]
+        if calibrated:
+            u, v0 = calibrated
+            xy = xy @ np.column_stack((u, [-u[1], u[0]])) * core.S_ARCSEC / v0
+        xy[~valid] = np.nan
+        times = data[:, 0] - origin[0]
+        self.x_curve.setData(times, xy[:, 0], connect="finite")
+        self.y_curve.setData(times, xy[:, 1], connect="finite")
+        return origin
+
+    def _command_marker(self, t):
+        if math.isfinite(finite(t)):
+            item = pg.InfiniteLine(t, pen=pg.mkPen("#92a7bc", style=QtCore.Qt.PenStyle.DotLine))
+            self.time_plot.addItem(item)
+            self.fit_items.append(item)
+            self._has_commands = True
+
+    def _update_map_caption(self):
+        empty = "Run Start map to measure multiple angles. Measure here produces one point, no full map. "
+        self.map_caption.setText(
+            (empty if not self.rows else "Measured points only; unsampled angles are unknown. ") +
+            "Current = cyan; saved baseline = purple. Circle = median; triangle = forward → reverse; "
+            "square = reverse → forward. Whiskers = diagnostic allowance, NOT a confidence interval. "
+            "Scatter only: no connections across unknown samples or pier sides.")
 
     @QtCore.Slot(str)
     def _on_ready(self, state):
@@ -1160,39 +1330,70 @@ class MainWindow(QtWidgets.QMainWindow):
             self.geometry_check.setChecked(self.simulation)
             self.device_label.setText(f"{event['telescope']}\n{event['camera']}\n{event['width']} × {event['height']} binned pixels · bin {self.connected_binning}")
             self._auto_range = True
+            self.selected_position = None
+            self._update_guidance("Connected — no exposure or mount motion has started. Take a Full frame to see the field.")
             self._log("Connected. No movement at connection. Driver capabilities validated by adapters.")
         elif kind == "disconnected":
             self.connected = False
             self.current_connection = None
             self.can_slew = False
             self.pose = None
+            self.selected_position = None
             self.device_label.setText("No devices connected")
             self.banner.setText("SIMULATION DEFAULT · No hardware connected · Imported measurements are offline only")
+            self._update_guidance("Disconnected — connect devices to begin. No automatic exposures or mount motion.")
         elif kind == "pose":
             self.pose = event
             self.pose_label.setText(f"RA {event['ra']:.4f} h · Dec {event['dec']:+.2f}° · HA {event['ha']:+.3f} h · "
                                     f"angle {event['angle']:+.2f}° · alt {event['alt']:.1f}° · pier {event['pier']} · tracking {'ON' if event['tracking'] else 'OFF'}")
         elif kind == "selected":
+            self.selected_position = event.get("position")
             self.trail.clear()
             self.trail_item.setData([], [])
+            if self.selected_position is not None:
+                self.star_item.setData([self.selected_position[0]], [self.selected_position[1]])
+            else:
+                self.star_item.setData([], [])
+            self._update_guidance("Star selected — Measure here measures one point; stop Live preview first if active."
+                                  if self.selected_position is not None else
+                                  "No suitable star — take a Full frame and click an isolated star or retry Auto-select.")
             self._log(f"Selected absolute binned coordinates: {event['position']}")
         elif kind == "awaiting_star":
             self.pending = False
             self._log(f"No automatic star at {event['angle']:+g}°. Click full-frame image to retry this field, Auto-select to retry, or Skip. Pose is rechecked before measurement.")
         elif kind == "phase":
-            self.state_label.setText(f"{self.state.upper()}  /  {event['phase']}  ·  {event['duration']:.1f} s")
+            phase = event["phase"]
+            if phase == "drift":
+                self._reset_measurement_display()
+            self._pending_phase = True
+            if phase == "drift":
+                name, description = "Drift calibration", "Tracking is off; star drift measures the camera's RA direction and scale."
+            elif phase.startswith("sign"):
+                name, description = "Drive direction check", "A test drive checks which motor sign corresponds to forward RA motion."
+            elif phase.startswith("latency"):
+                name, description = "Drive response delay", "Same-direction speed changes estimate command latency separately from backlash."
+            elif phase.startswith("reverse"):
+                name, description = "Reverse drive", "Driving RA in reverse to measure the response after a direction change."
+            elif phase.startswith("forward"):
+                name, description = "Forward drive", "Driving RA forward to measure the other reversal direction."
+            else:
+                name, description = phase.replace("_", " "), "Recording star motion."
+            self._phase_description = f"{name} — {description}"
+            self.state_label.setText(f"{name.upper()}  ·  {event['duration']:.1f} s")
+            self._update_guidance(self._phase_description)
             self._log(f"Phase {event['phase']}: {event['duration']:.1f} s · raw rate {event['raw_rate']:+g}×")
-            if event["phase"] == "drift":
-                self.samples.clear()
-                self.trail.clear()
-                self.calibration = None
-                self.last_result = None
-                self.bracket_item.setData([], [])
         elif kind == "calibration":
             self.calibration = event
+            self._update_trajectory()
             self._log(f"Drift {event['v0']:.3f} px/s · RA unit vector {event['u']} · driver sign {event['sign']:+g}")
         elif kind == "sample":
-            self.samples.append((event["t"], event["x"], event["y"]))
+            if self.last_result is None:
+                self.samples.append(tuple(finite(event.get(key)) for key in ("t", "x", "y")))
+                origin = self._update_trajectory()
+                if self._pending_phase and origin is not None and math.isfinite(finite(event.get("t"))):
+                    self._command_marker(event["t"] - origin[0])
+                    self._pending_phase = False
+                    self._update_trajectory()
         self._gate()
 
     @QtCore.Slot(object)
@@ -1207,26 +1408,26 @@ class MainWindow(QtWidgets.QMainWindow):
         if self._auto_range:
             self._fit_image()
             self._auto_range = False
-        if math.isfinite(frame.x) and math.isfinite(frame.y):
-            self.trail.append((frame.x, frame.y))
+        x, y = finite(frame.x), finite(frame.y)
+        if math.isfinite(x) and math.isfinite(y):
+            if self.last_result is None:
+                self.trail.append((x, y))
             xy = np.asarray(self.trail)
-            self.trail_item.setData(xy[:, 0], xy[:, 1])
-            self.star_item.setData([frame.x], [frame.y])
+            if len(xy):
+                self.trail_item.setData(xy[:, 0], xy[:, 1], connect="finite")
+            self.star_item.setData([x], [y])
             self._zoom(frame)
-            if self.calibration:
-                u = np.asarray(self.calibration["u"])
-                start = np.array([frame.x, frame.y])
+            calibrated = self._trajectory_calibration()
+            if calibrated and self.last_result is None:
+                u, _ = calibrated
+                start = np.array([x, y])
                 end = start + 35 * u
                 self.direction_item.setData([start[0], end[0]], [start[1], end[1]])
-                if self.last_result:
-                    self._bracket(start, self.last_result)
-        q = frame.quality
+        elif self.last_result is None:
+            self.trail.append((float("nan"), float("nan")))
+        q = frame.quality or {}
         self.quality_label.setText(f"Absolute binned sensor coordinates · SNR {finite(q.get('snr')):.1f} · FWHM {finite(q.get('fwhm')):.2f} px · "
-                                   f"saturated {q.get('saturated')} · Cyan observed / orange inferred B × v₀ / S")
-        if self.samples:
-            data = np.asarray(self.samples)
-            self.x_curve.setData(data[:, 0] - data[0, 0], data[:, 1])
-            self.y_curve.setData(data[:, 0] - data[0, 0], data[:, 2])
+                                   f"saturated {q.get('saturated')}")
 
     def _zoom(self, frame):
         ix = int(round((frame.x - frame.origin[0]) / frame.step))
@@ -1265,37 +1466,75 @@ class MainWindow(QtWidgets.QMainWindow):
     @QtCore.Slot(object)
     def _on_result(self, result):
         self.last_result = result
-        self._log(f"Result: B={finite(result.get('backlash')):.3f} RA-axis arcsec · {result.get('quality', 'unknown')} · "
-                  f"diagnostic allowance ±{finite(result.get('uncertainty_arcsec')):.3f} (NOT a calibrated confidence interval)")
-        raw = result.get("_raw", {})
-        frames = np.asarray(raw.get("frames", [])).reshape(-1, 3)
+        summary = (f"B = {finite(result.get('backlash')):.3f} ± {finite(result.get('uncertainty_arcsec')):.3f} "
+                   f"RA-axis arcsec (diagnostic allowance, NOT a calibrated confidence interval) · "
+                   f"Quality: {result.get('quality', 'unknown')}")
+        notes = [str(note) for note in result.get("notes", [])]
+        reasons = "; ".join(notes) or str(result.get("reason") or "No quality reasons supplied.")
+        self.result_summary.setText(summary + "\n" + reasons)
+        self._log("Result: " + summary)
+        raw = result.get("_raw") or {}
+        self.samples.clear()
+        # Partial exports may have None/missing centroid components. Keep the
+        # row as a gap rather than dropping it and drawing across missing data.
+        source = raw.get("frames")
+        if source is not None:
+            for row in source:
+                values = list(row) if isinstance(row, (tuple, list, np.ndarray)) else []
+                self.samples.append(tuple(finite(values[i]) if i < len(values) else float("nan") for i in range(3)))
+        self.calibration = dict(u=result.get("u"), v0=result.get("drift_px_s"))
         for item in self.fit_items:
             self.time_plot.removeItem(item)
         self.fit_items.clear()
-        if len(frames) and result.get("u") is not None and finite(result.get("drift_px_s")) > 0:
-            u = np.asarray(result["u"])
-            v0 = result["drift_px_s"]
-            t0 = frames[0, 0]
-            along = frames[:, 1:] @ u * core.S_ARCSEC / v0
-            orth = frames[:, 1:] @ np.array([-u[1], u[0]]) * core.S_ARCSEC / v0
-            self.x_curve.setData(frames[:, 0] - t0, along - along[0])
-            self.y_curve.setData(frames[:, 0] - t0, orth - orth[0])
-            self.time_plot.setLabel("left", "RA / orthogonal displacement", units="arcsec")
-            self.time_plot.setTitle("Command-timed RA-axis projection & orthogonal noise diagnostic (not seeing subtraction)")
+        self._has_commands = self._has_fits = False
+        self._pending_phase = False
+        self.bracket_item.setData([], [])
+        origin = self._update_trajectory()
+        calibrated = self._trajectory_calibration()
+        if origin is not None:
+            for command in raw.get("cmds", []):
+                self._command_marker(finite(command[0]) - origin[0])
+        if origin is not None and calibrated:
+            u, v0 = calibrated
+            offset = origin[1:] @ u * core.S_ARCSEC / v0
             for transition in raw.get("trans", []):
-                tc = transition["t"]
-                line = pg.InfiniteLine(tc - t0, pen=pg.mkPen("#5e6f80", style=QtCore.Qt.PenStyle.DotLine))
-                self.time_plot.addItem(line)
-                self.fit_items.append(line)
+                tc = finite(transition.get("t"))
+                if not math.isfinite(tc):
+                    continue
+                if not raw.get("cmds"):
+                    self._command_marker(tc - origin[0])
                 for key, color, start, end in (("fit_before", "#77d6a5", -1., 0.), ("fit_after", "#ffac59", 0., 1.)):
-                    slope, intercept = transition[key][:2]
+                    fit = transition.get(key)
+                    if fit is None or len(fit) < 2:
+                        continue
+                    slope, intercept = map(finite, fit[:2])
+                    if not math.isfinite(slope) or not math.isfinite(intercept):
+                        continue
                     x = np.array([start, end])
-                    item = self.time_plot.plot(x + tc - t0, slope * x + intercept - along[0], pen=pg.mkPen(color, width=2))
+                    item = self.time_plot.plot(x + tc - origin[0], slope * x + intercept - offset, pen=pg.mkPen(color, width=2))
                     self.fit_items.append(item)
-            self._bracket(frames[-1, 1:], result)
-            self.calibration = dict(u=result["u"], v0=v0)
-        for note in result.get("notes", []):
-            self._log(str(note))
+                    self._has_fits = True
+            frames = np.asarray(self.samples)
+            valid = np.isfinite(frames).all(axis=1)
+            anchor = frames[valid][-1, 1:]
+            end = anchor + 35 * u
+            self.direction_item.setData([anchor[0], end[0]], [anchor[1], end[1]])
+            if self._has_fits and result.get("status", "completed") == "completed" and result.get("quality") in {"valid", "uncertain"}:
+                self._bracket(anchor, result)
+        if origin is not None:
+            # Show the complete recorded path, not only UI-throttled frames.
+            # Refit after completion so a wide preview cannot leave the
+            # inferred bracket and measured motion too small to inspect.
+            recorded = np.asarray(self.samples, dtype=float)
+            positions = recorded[:, 1:].copy()
+            positions[~np.isfinite(recorded).all(axis=1)] = np.nan
+            self.trail_item.setData(positions[:, 0], positions[:, 1], connect="finite")
+            self._fit_image()
+        self._update_trajectory()
+        self._update_guidance("Result available — inspect B ± diagnostic allowance and quality reasons in Trajectory. "
+                              "Measure here is one point; Start map measures multiple angles.")
+        for note in notes:
+            self._log(note)
 
     @QtCore.Slot(object)
     def _on_rows(self, rows):
@@ -1325,19 +1564,21 @@ class MainWindow(QtWidgets.QMainWindow):
         # clear() does not consistently clear LegendItem across pg releases.
         if self.map_plot.plotItem.legend:
             self.map_plot.plotItem.legend.clear()
-        for source, color, name in ((rows, "#4bdce8", "Current"), (self.baseline, "#a4a3ec", "Saved baseline")):
+        for source, color, name in ((rows, "#4bdce8", "Current (cyan)"), (self.baseline, "#a4a3ec", "Saved baseline (purple)")):
             usable = [r for r in source if math.isfinite(finite(r.get("angle"))) and math.isfinite(finite(r.get("backlash")))]
             if usable:
                 x = np.array([float(r["angle"]) for r in usable])
                 y = np.array([float(r["backlash"]) for r in usable])
-                self.map_plot.plot(x, y, pen=None, symbol="o", symbolBrush=color, name=name)
+                self.map_plot.plot(x, y, pen=None, symbol="o", symbolBrush=color, name=name + " · median (circle)")
                 for key, symbol in (("fwd_rev", "t"), ("rev_fwd", "s")):
                     directional = np.array([finite(r.get(key)) for r in usable])
                     present = np.isfinite(directional)
                     # Scatter bounds use nanmin/nanmax, even for an entirely
                     # missing series. Never send absent/nonfinite points.
                     if present.any():
-                        self.map_plot.plot(x[present], directional[present], pen=None, symbol=symbol, symbolSize=6, symbolBrush=color)
+                        direction = "forward → reverse (triangle)" if key == "fwd_rev" else "reverse → forward (square)"
+                        self.map_plot.plot(x[present], directional[present], pen=None, symbol=symbol, symbolSize=6,
+                                           symbolBrush=color, name=name + " · " + direction)
                 err = np.array([finite(r.get("uncertainty_arcsec"), 0.) for r in usable])
                 self.map_plot.addItem(pg.ErrorBarItem(x=x, y=y, height=2 * err, beam=1.2, pen=color))
         candidate = core.candidate(rows)
@@ -1345,6 +1586,7 @@ class MainWindow(QtWidgets.QMainWindow):
             self._log(f"Qualified measured candidate {candidate['angle']:+g}° · {candidate['candidate_note']} · select table row to inspect/return")
         if mismatches:
             self._log(f"Warning: {mismatches} row(s) do not match saved baseline angle/Dec; comparison withheld.")
+        self._update_map_caption()
         self._gate()
 
     @staticmethod
@@ -1388,15 +1630,9 @@ class MainWindow(QtWidgets.QMainWindow):
                 self.baseline = rows
                 self._on_rows(self.rows)
             else:
-                self.last_result = None
-                self.trail.clear()
+                self._reset_measurement_display()
                 self.image_item.clear()
                 self.zoom_item.clear()
-                for item in (self.trail_item, self.star_item, self.bracket_item, self.direction_item, self.x_curve, self.y_curve):
-                    item.setData([], [])
-                for item in self.fit_items:
-                    self.time_plot.removeItem(item)
-                self.fit_items.clear()
                 self._on_rows(rows)
             self._log(f"Loaded {len(rows)} saved row(s). Offline data: no camera images reconstructed; imported results cannot authorize candidate return.")
         except Exception as exc:

@@ -1,5 +1,14 @@
 # Change log
 
+## Desktop clarity update
+
+- Persistent next-step instructions after connection, star selection, measurement, Stop and faults; distinguish a single-point measurement from an angle map.
+- Permanent color/shape keys for camera overlays and map points, readable trajectory legends for samples, commands and before/after fits, and plain-language phase descriptions.
+- Visible backlash/quality summary and explanations of inferred movement versus observed motion and diagnostic allowances versus confidence intervals.
+- Consistent live/calibrated trajectory units; reset old fits and overlays at each real measurement start, preserve completed plots during preview, and keep missing-data gaps.
+- Full recorded centroid path and refitted completed image view; minimum plot height and high-contrast two-column legends.
+- 157 local tests passed with warnings treated as errors, including simulator signal-path and display regressions. Hardware verification remains pending; motion control and the estimator are unchanged.
+
 ## 0.2.0 — Experimental desktop foundation
 
 ### Application scope
