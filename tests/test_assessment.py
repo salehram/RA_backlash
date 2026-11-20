@@ -22,7 +22,7 @@ def test_default_detection_and_next_action_not_arbitrary_mount_tolerance():
     assert a["status"] == "measurable"
     assert a["title"] == "Measurable backlash — size target not set"
     assert a["target_arcsec"] is None
-    assert "same pose" in a["action"] and "Start map" in a["action"]
+    assert "same pose" in a["action"] and "several angles" in a["action"]
     assert "before" in a["action"]
     assert "no universal safe mesh gap" in a["binding_warning"]
     assert "cannot detect binding" in a["binding_warning"]
@@ -168,3 +168,32 @@ def test_empty_or_invalid_map_has_no_extrema(rows):
     a = assess_map(rows)
     assert a["qualified_angles"] == 0
     assert a["status"] == "insufficient"
+
+@pytest.mark.parametrize("changes,target,verdict,words", [
+    (dict(backlash=30.), 10., "large", "LARGE"),
+    (dict(backlash=5., uncertainty_arcsec=1.), 10., "acceptable", "ACCEPTABLE"),
+    (dict(backlash=10.), 10., "borderline", "BORDERLINE"),
+    (dict(backlash=12.), None, "measured", "BACKLASH MEASURED"),
+    (dict(backlash=1., uncertainty_arcsec=3.), 10., "none_detected", "NO BACKLASH DETECTED"),
+    (dict(quality="uncertain"), 10., "inconclusive", "INCONCLUSIVE"),
+    (dict(backlash=None), 10., "unreliable", "UNRELIABLE"),
+    (dict(status="cancelled"), 10., "unreliable", "UNRELIABLE"),
+])
+def test_plain_language_verdicts(changes, target, verdict, words):
+    a = assess_result(result(**changes), target)
+    assert a["verdict"] == verdict
+    assert words in a["headline"]
+    assert a["summary"]
+
+
+def test_none_detected_is_neither_zero_nor_binding_claim():
+    a = assess_result(result(backlash=0.5, uncertainty_arcsec=2.), 10.)
+    assert "cannot tell which" in a["summary"]
+    assert "tight/binding" in a["summary"]
+    assert "zero" not in a["headline"].lower()
+
+
+def test_large_and_acceptable_verdicts_never_order_a_blind_adjustment():
+    large = assess_result(result(backlash=30.), 10.)["summary"]
+    assert "repeat measurement agrees" in large and "Do not adjust from one run" in large
+    assert "no adjustment is needed" in assess_result(result(backlash=3., uncertainty_arcsec=1.), 10.)["summary"].lower()

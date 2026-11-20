@@ -1,5 +1,12 @@
 # Change log
 
+## Plain-language interface and freeze fix
+
+- Fixed the window going "Not Responding" during simulated multi-angle runs: the worker emitted ~200 samples/s with no pacing and each one redrew plots, so a slightly slower GUI built an unbounded event backlog (a 44 s stall was reproduced). Sample handling is now an O(1) append with a coalesced 10 Hz redraw, and camera frames use backpressure.
+- Added an always-visible coloured result box with a plain verdict (ACCEPTABLE, LARGE, BORDERLINE, BACKLASH MEASURED, NO BACKLASH DETECTED, INCONCLUSIVE, UNRELIABLE) and an acceptable-limit control (starting guess 10 arcsec, editable, remembered, not a manufacturer spec).
+- Renamed buttons, groups and fields in plain language (1 · Take picture, 2 · Pick star automatically, 3 · Measure backlash, Measure at several angles…); added step-n-of-N and angle-k-of-M progress and run-time estimates in confirmations; clarified that multi-angle runs choose their own stars.
+- Removed '&' from tab titles (Qt rendered it as a mnemonic) and gave the camera picture more room.
+
 ## Result interpretation update
 
 - Added a scrollable **Result & next action** tab with evidence-based interpretation, quality reasons, diagnostics, map comparisons and explicit next steps.

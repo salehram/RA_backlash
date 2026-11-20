@@ -99,6 +99,8 @@ class DeviceWorker(QtCore.QThread):
         self.selected = None
         self.geometry = False
         self._last_frame = 0.
+        # Set when a frame is emitted; the GUI clears it so a slow GUI never builds a backlog.
+        self._frame_sent_at = 0.
         self._last_pose = 0.
         self._live_results = {}
         self._connection = ""
@@ -518,9 +520,9 @@ class DeviceWorker(QtCore.QThread):
 
     def _publish_frame(self, frame, force=False):
         now = time.monotonic()
-        if not force and now - self._last_frame < .10:
+        if not force and (now - self._last_frame < .10 or 0 < now - self._frame_sent_at < 2.):
             return
-        self._last_frame = now
+        self._last_frame = self._frame_sent_at = now
         source = frame["image"]
         step = max(1, math.ceil(max(source.shape) / 1400))
         # bytes backing prevents re-enabling WRITEABLE, not just accidental writes.
@@ -653,6 +655,7 @@ class DeviceWorker(QtCore.QThread):
                     continue
                 row["status"] = "running"
                 core.save_manifest(folder, rows, status)
+                self.event.emit(dict(type="map_point", index=index, total=len(rows), angle=row["angle"]))
                 pose = self._slew(row["angle"], row["dec"])
                 row["expected_pier"] = pose["pier"]
                 if not self._acquire() and not self._wait_star(row):
@@ -727,6 +730,14 @@ QHeaderView::section { background: #233848; color: #b6ccde; padding: 5px; border
 QTabBar::tab { background: #192b3a; padding: 8px 18px; } QTabBar::tab:selected { background: #28516a; }
 QSplitter::handle { background: #263949; } QScrollArea { border: 0; }
 QStatusBar { background: #192b38; } QToolTip { background: #294254; color: white; border: 1px solid #6c91aa; }
+QFrame#verdict { background: #1b2b38; border: 2px solid #40596c; border-radius: 8px; }
+QFrame#verdict[verdict="large"] { background: #4a2327; border-color: #d4545c; }
+QFrame#verdict[verdict="acceptable"] { background: #1d4030; border-color: #4fc98a; }
+QFrame#verdict[verdict="borderline"], QFrame#verdict[verdict="none_detected"], QFrame#verdict[verdict="inconclusive"] { background: #46391c; border-color: #e0b04a; }
+QFrame#verdict[verdict="measured"] { background: #1d3a4d; border-color: #4bb4e0; }
+QFrame#verdict[verdict="unreliable"] { background: #3a2a2a; border-color: #a06060; }
+QLabel#verdict_headline { font-size: 17px; font-weight: bold; color: #ffffff; background: transparent; }
+QFrame#verdict QLabel, QFrame#verdict QCheckBox { background: transparent; }
 """
 
 
@@ -754,9 +765,16 @@ class MainWindow(QtWidgets.QMainWindow):
         self._display_workflow = None
         self.trail = deque(maxlen=2000)
         self.samples = deque(maxlen=12000)
+        self._trajectory_dirty = False
+        self._pending_markers = []
+        self._trajectory_drawn = 0.
+        self._trajectory_timer = QtCore.QTimer(self)
+        self._trajectory_timer.setSingleShot(True)
+        self._trajectory_timer.timeout.connect(self._flush_trajectory)
         self.calibration = None
         self.selected_position = None
         self._phase_description = ""
+        self._map_progress = ""
         self._auto_range = True
         self._build_ui()
         self.setStyleSheet(DARK_STYLE)
@@ -795,6 +813,37 @@ class MainWindow(QtWidgets.QMainWindow):
         self.guidance_label.setWordWrap(True)
         self.guidance_label.setObjectName("banner")
         layout.addWidget(self.guidance_label)
+        self.verdict_card = QtWidgets.QFrame()
+        self.verdict_card.setObjectName("verdict")
+        card = QtWidgets.QVBoxLayout(self.verdict_card)
+        self.verdict_headline = QtWidgets.QLabel()
+        self.verdict_headline.setObjectName("verdict_headline")
+        self.verdict_detail = QtWidgets.QLabel()
+        for label in (self.verdict_headline, self.verdict_detail):
+            label.setWordWrap(True)
+            label.setTextFormat(QtCore.Qt.TextFormat.PlainText)
+            card.addWidget(label)
+        limit_row = QtWidgets.QHBoxLayout()
+        self.target_check = QtWidgets.QCheckBox("Compare with my acceptable limit:")
+        self.target_check.setChecked(self.settings.value("limit/enabled", True, type=bool))
+        self.target_spin = QtWidgets.QDoubleSpinBox()
+        self.target_spin.setDecimals(1)
+        self.target_spin.setRange(0., 1_000_000.)
+        self.target_spin.setValue(self.settings.value("limit/arcsec", 10., type=float))
+        self.target_spin.setSuffix(" arcsec")
+        self.target_spin.setEnabled(self.target_check.isChecked())
+        limit_tip = ("Starting value only. This app does not know your mount's specification or your guiding "
+                     "error. A common-sense rule: backlash matters when it is larger than your typical guiding "
+                     "error or seeing. Set a value that suits your setup. It is only used to word the result "
+                     "and is remembered on this computer. It is not saved in the measurement files.")
+        self.target_check.setToolTip(limit_tip)
+        self.target_spin.setToolTip(limit_tip)
+        limit_row.addWidget(self.target_check)
+        limit_row.addWidget(self.target_spin)
+        limit_row.addWidget(QtWidgets.QLabel("(starting guess — set your own; not a manufacturer spec)"))
+        limit_row.addStretch()
+        card.addLayout(limit_row)
+        layout.addWidget(self.verdict_card)
         split = QtWidgets.QSplitter()
         layout.addWidget(split, 1)
         sidebar_scroll = QtWidgets.QScrollArea()
@@ -805,56 +854,57 @@ class MainWindow(QtWidgets.QMainWindow):
         self.sidebar_layout = QtWidgets.QVBoxLayout(sidebar)
         sidebar_scroll.setWidget(sidebar)
         split.addWidget(sidebar_scroll)
-        connection = QtWidgets.QGroupBox("01  Connection & camera")
+        connection = QtWidgets.QGroupBox("Step 0 · Connect")
         box = QtWidgets.QVBoxLayout(connection)
         self.device_label = QtWidgets.QLabel("No devices connected")
         self.device_label.setWordWrap(True)
         box.addWidget(self.device_label)
-        self.connect_button = self._button("Connect devices…", self._connect_dialog, box)
+        self.connect_button = self._button("Connect camera && mount… (or Simulation)", self._connect_dialog, box)
         self.disconnect_button = self._button("Disconnect", lambda: self._launch("disconnect"), box)
         self.sidebar_layout.addWidget(connection)
-        self.settings_box = QtWidgets.QGroupBox("02  Acquisition & measurement")
+        self.settings_box = QtWidgets.QGroupBox("Camera && measurement settings")
         form = QtWidgets.QFormLayout(self.settings_box)
         self.fields = {}
-        self._field(form, "exposure", "Exposure (s)", .1, .001, 30, 3)
-        self._field(form, "acq_exposure", "Acquire (s)", 1., .001, 30, 3)
-        self._field(form, "binning", "Symmetric bin (reconnect)", 1, 1, 16)
-        self._field(form, "roi", "Tracking ROI (binned px)", 160, 24, 4096)
-        self._field(form, "cycles", "Reversal cycles", 3, 1, 30)
+        self._field(form, "exposure", "Exposure per frame (s)", .1, .001, 30, 3)
+        self._field(form, "acq_exposure", "Exposure for finding stars (s)", 1., .001, 30, 3)
+        self._field(form, "binning", "Pixel binning (set when connecting)", 1, 1, 16)
+        self._field(form, "roi", "Star tracking box size (px)", 160, 24, 4096)
+        self._field(form, "cycles", "Repeats (more = steadier, slower)", 3, 1, 30)
         self.sidebar_layout.addWidget(self.settings_box)
-        self.advanced_box = QtWidgets.QGroupBox("Advanced · recalibrated each run")
+        self.advanced_box = QtWidgets.QGroupBox("Advanced (defaults are fine)")
         adv = QtWidgets.QFormLayout(self.advanced_box)
         for key, label, value, low, high in (
-            ("min_alt", "Minimum altitude (°)", 25., 0., 85.),
-            ("dec", "Preferred Dec (°)", 0., -75., 75.),
-            ("settle", "Settle (s)", 3., 0., 120.),
-            ("rate", "Reversal rate (sidereal)", 2., 1.01, 20.),
-            ("phase", "Reverse phase (s)", 5., 2., 120.),
-            ("cal", "Calibration phase (s)", 4., 2., 120.),
-            ("min_snr", "Minimum SNR", 6., 1., 100.)):
+            ("min_alt", "Lowest allowed altitude (°)", 25., 0., 85.),
+            ("dec", "Declination to test at (°)", 0., -75., 75.),
+            ("settle", "Wait after moving (s)", 3., 0., 120.),
+            ("rate", "Back-and-forth speed (× sidereal)", 2., 1.01, 20.),
+            ("phase", "Seconds per back-and-forth leg", 5., 2., 120.),
+            ("cal", "Seconds for star-motion calibration", 4., 2., 120.),
+            ("min_snr", "Minimum star brightness (SNR)", 6., 1., 100.)):
             self._field(adv, key, label, value, low, high, 2)
         self.sidebar_layout.addWidget(self.advanced_box)
-        self.planner_box = QtWidgets.QGroupBox("03  Signed-angle map planner")
+        self.planner_box = QtWidgets.QGroupBox("Optional · measure at several angles")
         form = QtWidgets.QFormLayout(self.planner_box)
-        self._field(form, "count", "Points / signed group", 3, 1, 20)
-        self._field(form, "first", "First magnitude (°)", 25., .1, 82., 2)
-        self._field(form, "spacing", "Spacing (°)", 25., .1, 82., 2)
+        self._field(form, "count", "Angles per side", 3, 1, 20)
+        self._field(form, "first", "First angle (°)", 25., .1, 82., 2)
+        self._field(form, "spacing", "Step between angles (°)", 25., .1, 82., 2)
         self.side = QtWidgets.QComboBox()
         self.side.addItems(["both", "negative", "positive"])
-        form.addRow("Signed group (not pier side)", self.side)
+        form.addRow("Which side(s) of the meridian*", self.side)
         self.angle_list = QtWidgets.QLineEdit()
-        self.angle_list.setPlaceholderText("Optional: -75,-50,-25,25,50,75")
-        form.addRow("Explicit ordered angles", self.angle_list)
+        self.angle_list.setPlaceholderText("Or type your own: -75,-50,-25,25,50,75")
+        form.addRow("Custom angle list", self.angle_list)
         self.geometry_check = QtWidgets.QCheckBox("I verified northern, counterweight-down\nGEM geometry and driver pier interpretation")
         self.geometry_check.setToolTip("Operator validation is not a guarantee of collision clearance. Unsupported geometry is refused.")
         form.addRow(self.geometry_check)
-        self.plan_button = QtWidgets.QPushButton("Preview actual feasible plan")
+        self.plan_button = QtWidgets.QPushButton("Check which angles are reachable")
         self.plan_button.clicked.connect(lambda: self._plan_or_map(False))
         form.addRow(self.plan_button)
-        self.map_button = QtWidgets.QPushButton("Start map…")
+        self.map_button = QtWidgets.QPushButton("Measure at several angles…")
         self.map_button.clicked.connect(lambda: self._plan_or_map(True))
         form.addRow(self.map_button)
-        self.refine_button = QtWidgets.QPushButton("Refine selected candidate…")
+        form.addRow(QtWidgets.QLabel("* Angles are signed mount positions, not the physical pier side."))
+        self.refine_button = QtWidgets.QPushButton("Measure more around the best angle…")
         self.refine_button.clicked.connect(self._refine)
         form.addRow(self.refine_button)
         self.sidebar_layout.addWidget(self.planner_box)
@@ -866,16 +916,16 @@ class MainWindow(QtWidgets.QMainWindow):
         image_panel = QtWidgets.QWidget()
         image_layout = QtWidgets.QVBoxLayout(image_panel)
         actions = QtWidgets.QHBoxLayout()
-        self.preview_button = self._button("Full frame", lambda: self._launch("preview", continuous=False), actions)
-        self.live_button = self._button("Live preview", lambda: self._launch("preview", continuous=True), actions)
-        self.auto_button = self._button("Auto-select / retry", lambda: self._launch("auto_select"), actions)
-        self.measure_button = self._button("Measure here", self._measure, actions)
+        self.preview_button = self._button("1 · Take picture", lambda: self._launch("preview", continuous=False), actions)
+        self.live_button = self._button("Live view (optional)", lambda: self._launch("preview", continuous=True), actions)
+        self.auto_button = self._button("2 · Pick star automatically", lambda: self._launch("auto_select"), actions)
+        self.measure_button = self._button("3 · Measure backlash", self._measure, actions)
         self.measure_button.setObjectName("primary")
-        self.skip_button = self._button("Skip field", lambda: self._launch("skip"), actions)
-        self._button("Fit image", self._fit_image, actions)
+        self.skip_button = self._button("Skip this position", lambda: self._launch("skip"), actions)
+        self._button("Reset zoom", self._fit_image, actions)
         image_layout.addLayout(actions)
         views = QtWidgets.QSplitter()
-        self.image_plot = pg.PlotWidget(title="Camera · click a star · full-frame binned coordinates")
+        self.image_plot = pg.PlotWidget(title="Camera picture — click a star to select it")
         self.image_plot.setAspectLocked(True)
         self.image_plot.invertY(True)
         self.image_plot.setLabel("bottom", "Sensor x", units="px")
@@ -888,7 +938,7 @@ class MainWindow(QtWidgets.QMainWindow):
         self.direction_item = self.image_plot.plot(pen=pg.mkPen("#92a7bc", style=QtCore.Qt.PenStyle.DashLine))
         self.image_plot.scene().sigMouseClicked.connect(self._image_clicked)
         views.addWidget(self.image_plot)
-        self.zoom_plot = pg.PlotWidget(title="Selected star · 64 × 64 binned px")
+        self.zoom_plot = pg.PlotWidget(title="Selected star (zoom)")
         self.zoom_plot.setAspectLocked(True)
         self.zoom_plot.invertY(True)
         self.zoom_item = pg.ImageItem(axisOrder="row-major")
@@ -925,23 +975,14 @@ class MainWindow(QtWidgets.QMainWindow):
             label.setTextFormat(QtCore.Qt.TextFormat.PlainText)
             label.setTextInteractionFlags(QtCore.Qt.TextInteractionFlag.TextSelectableByMouse)
             assessment_layout.addWidget(label)
-        goal_form = QtWidgets.QFormLayout()
-        self.target_check = QtWidgets.QCheckBox("Maximum acceptable backlash (RA-axis arcsec)")
-        self.target_spin = QtWidgets.QDoubleSpinBox()
-        self.target_spin.setDecimals(3)
-        self.target_spin.setRange(0., 1_000_000.)
-        self.target_spin.setEnabled(False)
-        goal_form.addRow(self.target_check, self.target_spin)
-        assessment_layout.addLayout(goal_form)
         goal_note = QtWidgets.QLabel(
-            "Optional selected comparison goal only — not a manufacturer tolerance or safe mesh gap. "
-            "Off by default; kept only in this window. Interpretation only, not saved with results. "
-            "Changes do not rerun measurement or command hardware.")
+            "The acceptable limit above is a comparison goal you choose — not a manufacturer tolerance or safe mesh gap. "
+            "It only changes the wording of the result and never reruns a measurement or moves hardware.")
         goal_note.setWordWrap(True)
         assessment_layout.addWidget(goal_note)
         self.assessment_details = QtWidgets.QPlainTextEdit()
         self.assessment_details.setReadOnly(True)
-        self.assessment_details.setMinimumHeight(155)
+        self.assessment_details.setMinimumHeight(90)
         assessment_layout.addWidget(self.assessment_details)
         self.map_assessment_label = QtWidgets.QLabel()
         self.map_assessment_label.setWordWrap(True)
@@ -953,9 +994,11 @@ class MainWindow(QtWidgets.QMainWindow):
         assessment_layout.addWidget(self.map_assessment_label)
         self.target_check.toggled.connect(self._reassess)
         self.target_spin.valueChanged.connect(self._reassess)
-        tabs.addTab(self.assessment_panel, "Result & next action")
+        self.target_check.toggled.connect(self._save_limit)
+        self.target_spin.valueChanged.connect(self._save_limit)
+        tabs.addTab(self.assessment_panel, "Result details")
         self.time_plot = pg.PlotWidget(title="Raw sensor coordinates vs time · calibration required for RA projection")
-        self.time_plot.setMinimumHeight(220)
+        self.time_plot.setMinimumHeight(130)
         self.time_plot.addLegend(colCount=2, brush=pg.mkBrush("#172633"),
                      pen=pg.mkPen("#40596c"), labelTextColor="#dbe5ef")
         self.time_plot.setLabel("bottom", "Time from first valid sample", units="s")
@@ -966,6 +1009,7 @@ class MainWindow(QtWidgets.QMainWindow):
         self._before_sample = pg.PlotDataItem(pen=pg.mkPen("#77d6a5", width=2))
         self._after_sample = pg.PlotDataItem(pen=pg.mkPen("#ffac59", width=2))
         self._trajectory_legend_names = []
+        self._trajectory_style = None
         self._has_commands = self._has_fits = False
         self._pending_phase = False
         self.trajectory_caption = QtWidgets.QLabel()
@@ -978,11 +1022,11 @@ class MainWindow(QtWidgets.QMainWindow):
         trajectory_layout.addWidget(self.result_summary)
         trajectory_layout.addWidget(self.time_plot, 1)
         trajectory_layout.addWidget(self.trajectory_caption)
-        tabs.addTab(self.trajectory_panel, "Trajectory & transitions")
+        tabs.addTab(self.trajectory_panel, "Trajectory graph")
         self.map_plot = pg.PlotWidget(title="Measured backlash · diagnostic allowances, not confidence intervals")
         self.map_plot.setLabel("bottom", "Signed mechanical angle (not pier side)", units="°")
         self.map_plot.setLabel("left", "RA-axis backlash", units="arcsec")
-        self.map_plot.setMinimumHeight(220)
+        self.map_plot.setMinimumHeight(130)
         self.map_plot.addLegend(colCount=2, brush=pg.mkBrush("#172633"),
                     pen=pg.mkPen("#40596c"), labelTextColor="#dbe5ef")
         self.map_caption = QtWidgets.QLabel()
@@ -991,11 +1035,11 @@ class MainWindow(QtWidgets.QMainWindow):
         map_layout = QtWidgets.QVBoxLayout(self.map_panel)
         map_layout.addWidget(self.map_plot, 1)
         map_layout.addWidget(self.map_caption)
-        tabs.addTab(self.map_panel, "Map & baseline")
+        tabs.addTab(self.map_panel, "Several-angle map")
         self._update_map_caption()
         self._reset_measurement_display()
         self.table = QtWidgets.QTableWidget(0, 11)
-        self.table.setHorizontalHeaderLabels(["Angle °", "HA h", "Dec °", "Alt °", "State / quality", "B arcsec", "Diagnostic ±", "Fwd → rev", "Rev → fwd", "N", "Reason / comparison"])
+        self.table.setHorizontalHeaderLabels(["Angle °", "HA h", "Dec °", "Alt °", "Status / quality", "Backlash (arcsec)", "± allowance (arcsec)", "Fwd → rev", "Rev → fwd", "N", "Reason / comparison"])
         self.table.setAlternatingRowColors(True)
         self.table.setSelectionBehavior(QtWidgets.QAbstractItemView.SelectionBehavior.SelectRows)
         self.table.setSelectionMode(QtWidgets.QAbstractItemView.SelectionMode.SingleSelection)
@@ -1004,14 +1048,14 @@ class MainWindow(QtWidgets.QMainWindow):
         self.table.horizontalHeader().setStretchLastSection(True)
         self.table.itemSelectionChanged.connect(self._gate)
         self.table.itemSelectionChanged.connect(self._assess_selection)
-        tabs.addTab(self.table, "Plan & measurements")
+        tabs.addTab(self.table, "Measurements table")
         center.addWidget(tabs)
-        center.setSizes([340, 370])
+        center.setSizes([620, 180])
         footer = QtWidgets.QHBoxLayout()
-        self.import_button = self._button("Import saved results…", lambda: self._import(False), footer)
-        self.baseline_button = self._button("Select saved baseline…", lambda: self._import(True), footer)
-        self.candidate_button = self._button("Return to selected candidate…", self._return_candidate, footer)
-        self.finish_button = self._button("Finish adjustment / enable tracking…", self._finish_adjustment, footer)
+        self.import_button = self._button("Open saved results…", lambda: self._import(False), footer)
+        self.baseline_button = self._button("Compare with saved results…", lambda: self._import(True), footer)
+        self.candidate_button = self._button("Go back to selected angle to adjust…", self._return_candidate, footer)
+        self.finish_button = self._button("Done adjusting — resume tracking…", self._finish_adjustment, footer)
         self.stop_button = self._button("■  STOP", self._stop, footer)
         self.stop_button.setObjectName("stop")
         self.stop_button.setMinimumWidth(120)
@@ -1028,15 +1072,15 @@ class MainWindow(QtWidgets.QMainWindow):
         self.pose_button = refresh
         self.statusBar().addPermanentWidget(refresh)
         for button, tip in (
-            (self.connect_button, "Connect only: no exposure or mount motion starts automatically."),
-            (self.preview_button, "1 · Take one full-frame image to find an isolated star. No RA drive."),
-            (self.live_button, "Repeat preview exposures until Stop. Stop preview before measuring."),
-            (self.auto_button, "2 · Acquire an isolated star automatically, or click one in the image."),
-            (self.measure_button, "3 · Measure one point here with calibration and RA reversals. Auto-selects if no star chosen; asks before motion."),
-            (self.map_button, "Measure multiple signed angles with slews and fresh calibration at each point; asks before motion."),
-            (self.plan_button, "Show feasible targets in the table without slewing or exposing."),
-            (self.stop_button, "Request cooperative stop. A hung driver may require native mount controls."),
-            (self.skip_button, "Skip this map field; do not measure an unselected star."),
+            (self.connect_button, "Connects only: no picture is taken and the mount does not move. Choose Simulation to practice."),
+            (self.preview_button, "Step 1: take one picture of the whole sensor so you can see the stars. The mount does not move."),
+            (self.live_button, "Keep taking pictures until you press STOP. Stop it before measuring."),
+            (self.auto_button, "Step 2: let the app choose an isolated star. You can also just click a star in the picture."),
+            (self.measure_button, "Step 3: measure the backlash at the current position. Takes about a minute and a half on a real mount; asks before moving. Picks a star itself if you have not."),
+            (self.map_button, "Repeat the measurement at several angles to see where the mount is tightest or loosest. Moves the mount; picks its own star at each angle; asks first."),
+            (self.plan_button, "Lists which angles can be reached. Nothing moves and no pictures are taken."),
+            (self.stop_button, "Ask the app to stop. This is a software request, not an emergency stop; use the mount's own controls if a driver hangs."),
+            (self.skip_button, "Skip this angle instead of measuring an unselected star."),
         ):
             button.setToolTip(tip)
 
@@ -1135,7 +1179,12 @@ class MainWindow(QtWidgets.QMainWindow):
         try:
             angles = self._angles()
             cfg = self._config()
-            if move and not self._confirm_motion(f"Map explicit signed angles: {angles}\nPreferred Dec {cfg.dec:g}°, minimum altitude {cfg.min_alt:g}°. Feasible Dec may differ; inspect the plan first."):
+            if move and not self._confirm_motion(
+                    f"Measure backlash at {len(angles)} angles: {', '.join(f'{a:+g}°' for a in angles)}.\n"
+                    f"At each angle the mount moves there, the app picks its own star (the star you clicked is not used), "
+                    f"then runs the full measurement — about {self._estimated_minutes()} min per angle on a real mount "
+                    f"(simulation: seconds).\n"
+                    f"Declination {cfg.dec:g}°, lowest altitude {cfg.min_alt:g}°; reachable angles may differ — use 'Check which angles are reachable' first."):
                 return
             self._save_profile()
             self._launch("map" if move else "plan", angles=angles, confirmed=move,
@@ -1144,8 +1193,10 @@ class MainWindow(QtWidgets.QMainWindow):
             self._warn(str(exc))
 
     def _measure(self):
-        if QtWidgets.QMessageBox.question(self, "Confirm RA measurement motion",
-                "Measurement stops tracking and drives RA through calibration and reversals. Stop guiding, confirm clearance and retain native controls. Continue?",
+        if QtWidgets.QMessageBox.question(self, "Start the backlash measurement?",
+                "The mount will stop tracking and drive RA slowly back and forth for about "
+                f"{self._estimated_minutes()} minute(s) on a real mount (a simulation takes seconds). "
+                "Stop guiding first, make sure nothing can collide or snag, and keep the mount's own controls within reach.\n\nStart?",
                 QtWidgets.QMessageBox.StandardButton.Yes | QtWidgets.QMessageBox.StandardButton.No,
                 QtWidgets.QMessageBox.StandardButton.No) != QtWidgets.QMessageBox.StandardButton.Yes:
             return
@@ -1215,29 +1266,61 @@ class MainWindow(QtWidgets.QMainWindow):
     def _update_guidance(self, message=None):
         if message is None:
             message = {
-                "disconnected": "Connect devices to begin. Connection alone takes no exposures and starts no mount motion.",
-                "connecting": "Connecting only — no automatic exposures or mount motion.",
-                "idle": ("Star selected — Measure here is ready." if self.selected_position is not None else
-                         "Ready — take a Full frame, then choose a star or let Measure here auto-select."),
-                "preview": "Preview exposure — Auto-select or click an isolated star. Stop Live preview before Measure here.",
-                "acquiring": "Finding / reacquiring the selected star before measurement; wait for acquisition.",
-                "awaiting_star": "No suitable star — click an isolated star, Auto-select to retry, or Skip field.",
-                "calibrating": "Calibrating camera direction and drive response; wait or Stop.",
-                "measuring": "Measuring RA reversals; wait for the fitted result or Stop.",
-                "analyzing": "Fitting the recorded trajectory and checking measurement quality.",
-                "completed": "Completed — inspect Result & next action for interpretation of B ± diagnostic allowance; Trajectory shows fits, Map & baseline shows sampled points.",
-                "fault": "Fault — use native controls if needed. Inspect the log, disconnect, then reconnect before retrying.",
-                "adjustment": "Adjustment interlock — RA stopped / tracking OFF reported. Clear hands/tools before Finish adjustment; reacquire for a new measurement.",
-                "stopping": "Stopping — waiting for cooperative cleanup, not returning the mount. Use native controls if a driver hangs.",
-                "slewing": "Moving to a requested map / candidate angle; wait or Stop. Keep native controls available.",
-                "settling": "Waiting for the mount to settle before selecting a star.",
-            }.get(self.state, "Wait for the current operation or Stop.")
-        timing = " Simulation uses fast virtual time; phases may flash by." if self.simulation else ""
+                "disconnected": "Click 'Connect camera & mount…'. Choose Simulation to practice without hardware.",
+                "connecting": "Connecting. Nothing moves and no pictures are taken yet.",
+                "idle": ("Star selected. Click '3 · Measure backlash'." if self.selected_position is not None else
+                         "Connected. Click '1 · Take picture' to see the stars."),
+                "preview": "Picture shown. Click '2 · Pick star automatically', or click a bright, isolated star in the picture. Stop Live view before measuring.",
+                "acquiring": "Locating the star (reacquiring). Wait a moment.",
+                "awaiting_star": "No usable star here. Click a bright isolated star in the picture, press 'Pick star automatically' to retry, or 'Skip this position'.",
+                "calibrating": "Learning how the star moves with the mount (tracking is off for a few seconds). Wait, or press STOP.",
+                "measuring": "Moving RA back and forth to find the slack in the gears. Wait, or press STOP.",
+                "analyzing": "Calculating the result from the recorded star positions.",
+                "completed": "Done. Read the coloured result box above; the 'Result details' tab explains it.",
+                "fault": "Something went wrong. Check the log below, use the mount's own controls if needed, then disconnect and reconnect.",
+                "adjustment": "Adjustment mode: RA stopped and tracking is off. Clear hands and tools, then press 'Done adjusting' when finished; measure again afterwards.",
+                "stopping": "Stopping. Waiting for the software to finish cleanly (a cooperative stop, not a hardware stop). Use the mount's own controls if a driver hangs.",
+                "slewing": "Moving the mount to the next test angle. Wait, or press STOP. Keep the mount's own controls within reach.",
+                "settling": "Waiting for the mount to settle before choosing a star.",
+            }.get(self.state, "Wait for the current operation to finish, or press STOP.")
+        if self._map_progress:
+            message = f"{self._map_progress} — {message}"
+        timing = " Simulation runs in fast virtual time, so phases may flash by." if self.simulation else ""
         self.guidance_label.setText(
             "<b>Next:</b> " + html.escape(message + timing) +
-            "<br><b>1 Full frame</b> → <b>2 Auto-select or click an isolated star</b> → "
-            "<b>3 Measure here</b> (auto-selects if no choice). "
-            "Measure here = one point; <b>Start map</b> = multiple signed angles. Measurement asks before RA motion.")
+            "<br><b>Steps:</b> 1 Take picture → 2 Pick a star (automatic, or click one) → 3 Measure backlash. "
+            "Step 3 tests one position and auto-picks a star if you skip step 2. "
+            "'Measure at several angles' (left panel) repeats it at each angle.")
+
+    def _phase_step(self, phase):
+        cycles = self.fields["cycles"].value()
+        total = 5 + 2 * cycles
+        fixed = ["drift", "sign", "sign_settle", "latency_fast", "latency_slow"]
+        if phase in fixed:
+            return fixed.index(phase) + 1, total
+        kind, _, number = phase.partition("_")
+        if kind in {"reverse", "forward"} and number.isdigit() and 1 <= int(number) <= cycles:
+            return 5 + 2 * (int(number) - 1) + (1 if kind == "reverse" else 2), total
+        return None
+
+    def _estimated_minutes(self):
+        """Real-mount time for one angle, excluding slews and star acquisition."""
+        cfg = self._config()
+        forward = cfg.phase * (1 + cfg.rate) / (cfg.rate - 1)
+        seconds = 2 * cfg.cal + 13 + cfg.cycles * (cfg.phase + forward)
+        return max(1, round(seconds / 60))
+
+    def _save_limit(self, *_):
+        self.settings.setValue("limit/enabled", self.target_check.isChecked())
+        self.settings.setValue("limit/arcsec", self.target_spin.value())
+
+    def _set_verdict(self, verdict, headline, detail):
+        self.verdict_headline.setText(headline)
+        self.verdict_detail.setText(detail)
+        if self.verdict_card.property("verdict") != verdict:
+            self.verdict_card.setProperty("verdict", verdict)
+            self.verdict_card.style().unpolish(self.verdict_card)
+            self.verdict_card.style().polish(self.verdict_card)
 
     def _reset_measurement_display(self):
         """Display-only reset at actual drift start, including map/confirmation points."""
@@ -1248,6 +1331,8 @@ class MainWindow(QtWidgets.QMainWindow):
         self._assessment_result = None
         self._reassess()
         self._pending_phase = False
+        self._pending_markers.clear()
+        self._trajectory_dirty = False
         self._has_commands = self._has_fits = False
         for item in self.fit_items:
             self.time_plot.removeItem(item)
@@ -1270,6 +1355,18 @@ class MainWindow(QtWidgets.QMainWindow):
             return u, v0
         return None
 
+    def _apply_trajectory_style(self, calibrated):
+        self.time_plot.setLabel("left", "RA / orthogonal displacement (RA-axis-equivalent)" if calibrated else
+                                "Sensor x / y displacement", units="arcsec" if calibrated else "px")
+        self.time_plot.setTitle("Calibrated RA-axis trajectory · relative to first valid sample" if calibrated else
+                               "Raw sensor displacement · awaiting drift calibration")
+        self.trajectory_caption.setText(
+            ("Calibrated: RA + orthogonal displacement in RA-axis-equivalent arcsec, both relative to the first valid sample. " if calibrated else
+             "Before calibration: sensor x + y displacement in pixels, relative to the first valid sample. ") +
+            "Observed star displacement includes intentional drives — it is NOT backlash alone or seeing removal. "
+            "Gray dotted = command / phase time (live: first sample); green = fit before, orange = fit after command. "
+            "Orange trajectory fit is NOT the image's inferred-backlash bracket. Missing samples leave gaps.")
+
     def _update_trajectory(self):
         """One origin/unit system for live samples and completed raw frames; retain gaps."""
         calibrated = self._trajectory_calibration()
@@ -1288,16 +1385,9 @@ class MainWindow(QtWidgets.QMainWindow):
             for item, name in entries:
                 legend.addItem(item, name)
             self._trajectory_legend_names = labels
-        self.time_plot.setLabel("left", "RA / orthogonal displacement (RA-axis-equivalent)" if calibrated else
-                                "Sensor x / y displacement", units="arcsec" if calibrated else "px")
-        self.time_plot.setTitle("Calibrated RA-axis trajectory · relative to first valid sample" if calibrated else
-                               "Raw sensor displacement · awaiting drift calibration")
-        self.trajectory_caption.setText(
-            ("Calibrated: RA + orthogonal displacement in RA-axis-equivalent arcsec, both relative to the first valid sample. " if calibrated else
-             "Before calibration: sensor x + y displacement in pixels, relative to the first valid sample. ") +
-            "Observed star displacement includes intentional drives — it is NOT backlash alone or seeing removal. "
-            "Gray dotted = command / phase time (live: first sample); green = fit before, orange = fit after command. "
-            "Orange trajectory fit is NOT the image's inferred-backlash bracket. Missing samples leave gaps.")
+        if self._trajectory_style != bool(calibrated):
+            self._trajectory_style = bool(calibrated)
+            self._apply_trajectory_style(bool(calibrated))
         data = np.asarray(self.samples, dtype=float).reshape(-1, 3)
         valid = np.isfinite(data).all(axis=1)
         if not valid.any():
@@ -1315,6 +1405,29 @@ class MainWindow(QtWidgets.QMainWindow):
         self.y_curve.setData(times, xy[:, 1], connect="finite")
         return origin
 
+    def _request_trajectory(self):
+        """Redraw at most ~10 Hz regardless of sample arrival rate."""
+        self._trajectory_dirty = True
+        wait = .1 - (time.monotonic() - self._trajectory_drawn)
+        if wait <= 0:
+            self._flush_trajectory()
+        elif not self._trajectory_timer.isActive():
+            self._trajectory_timer.start(max(1, int(wait * 1000)))
+
+    def _flush_trajectory(self):
+        self._trajectory_timer.stop()
+        if not self._trajectory_dirty:
+            return
+        self._trajectory_dirty = False
+        self._trajectory_drawn = time.monotonic()
+        origin = self._update_trajectory()
+        markers, self._pending_markers = self._pending_markers, []
+        if origin is not None:
+            for marker in markers:
+                self._command_marker(marker - origin[0])
+            if markers:
+                self._update_trajectory()
+
     def _command_marker(self, t):
         if math.isfinite(finite(t)):
             item = pg.InfiniteLine(t, pen=pg.mkPen("#92a7bc", style=QtCore.Qt.PenStyle.DotLine))
@@ -1323,7 +1436,7 @@ class MainWindow(QtWidgets.QMainWindow):
             self._has_commands = True
 
     def _update_map_caption(self):
-        empty = "Run Start map to measure multiple angles. Measure here produces one point, no full map. "
+        empty = "Run 'Measure at several angles' to fill this chart. 'Measure backlash' gives one position, not a full map. "
         self.map_caption.setText(
             (empty if not self.rows else "Measured points only; unsampled angles are unknown. ") +
             "Current = cyan; saved baseline = purple. Circle = median; triangle = forward → reverse; "
@@ -1333,6 +1446,7 @@ class MainWindow(QtWidgets.QMainWindow):
     @QtCore.Slot(str)
     def _on_ready(self, state):
         self.pending = False
+        self._map_progress = ""
         self._on_state(state)
         if state == "completed" and self._display_workflow == "measure" and self.last_result is not None:
             self.tabs.setCurrentWidget(self.assessment_panel)
@@ -1349,14 +1463,21 @@ class MainWindow(QtWidgets.QMainWindow):
     def _reassess(self, *_):
         self.target_spin.setEnabled(self.target_check.isChecked())
         if self._assessment_result is None:
+            self._set_verdict("none", "No measurement yet",
+                              "Follow the numbered buttons: 1 Take picture, 2 Pick star, 3 Measure backlash. "
+                              "The result appears here as a number plus a verdict (large / acceptable / none detected).")
             self.assessment_title.setText("No completed result selected")
-            self.assessment_meaning.setText("Measure here for one point, or select a saved/measured table row to interpret its evidence.")
-            self.assessment_action.setText("Next action: repeatable measurements first; Start map before mesh tuning.")
+            self.assessment_meaning.setText("Measure backlash for one position, or select a saved/measured table row to interpret its evidence.")
+            self.assessment_action.setText("Next action: repeatable measurements first; measure at several angles before mesh tuning.")
             self.assessment_warning.setText(assess_result(None)["binding_warning"])
             self.assessment_details.clear()
             return
         target = self.target_spin.value() if self.target_check.isChecked() else None
         assessment = assess_result(self._assessment_result, target)
+        detail = assessment["summary"]
+        if assessment["simulation"]:
+            detail = "SIMULATION: practice data that says nothing about your real mount. " + detail
+        self._set_verdict(assessment["verdict"], assessment["headline"], detail)
         self.assessment_title.setText(assessment["title"])
         self.assessment_title.setProperty("tone", assessment["tone"])
         self.assessment_meaning.setText(assessment["meaning"])
@@ -1418,7 +1539,7 @@ class MainWindow(QtWidgets.QMainWindow):
             self.device_label.setText(f"{event['telescope']}\n{event['camera']}\n{event['width']} × {event['height']} binned pixels · bin {self.connected_binning}")
             self._auto_range = True
             self.selected_position = None
-            self._update_guidance("Connected — no exposure or mount motion has started. Take a Full frame to see the field.")
+            self._update_guidance("Connected — nothing has moved yet. Click '1 · Take picture' to see the stars.")
             self._log("Connected. No movement at connection. Driver capabilities validated by adapters.")
         elif kind == "disconnected":
             self.connected = False
@@ -1441,50 +1562,62 @@ class MainWindow(QtWidgets.QMainWindow):
                 self.star_item.setData([self.selected_position[0]], [self.selected_position[1]])
             else:
                 self.star_item.setData([], [])
-            self._update_guidance("Star selected — Measure here measures one point; stop Live preview first if active."
+            self._update_guidance("Star selected — click '3 · Measure backlash' (stop Live view first if it is running)."
                                   if self.selected_position is not None else
-                                  "No suitable star — take a Full frame and click an isolated star or retry Auto-select.")
+                                  "No suitable star — click '1 · Take picture', then click an isolated star or retry 'Pick star automatically'.")
             self._log(f"Selected absolute binned coordinates: {event['position']}")
         elif kind == "awaiting_star":
             self.pending = False
-            self._log(f"No automatic star at {event['angle']:+g}°. Click full-frame image to retry this field, Auto-select to retry, or Skip. Pose is rechecked before measurement.")
+            self._log(f"No automatic star at {event['angle']:+g}°. Click a star in the picture to retry this angle, press 'Pick star automatically' to retry, or 'Skip this position'. The pose is rechecked before measuring.")
         elif kind == "phase":
             phase = event["phase"]
             if phase == "drift":
                 self._reset_measurement_display()
             self._pending_phase = True
             if phase == "drift":
-                name, description = "Drift calibration", "Tracking is off; star drift measures the camera's RA direction and scale."
+                name, description = "Drift calibration", "Tracking is off for a few seconds; the star's natural drift shows the camera's orientation and scale."
             elif phase.startswith("sign"):
-                name, description = "Drive direction check", "A test drive checks which motor sign corresponds to forward RA motion."
+                name, description = "Drive direction check", "A short test move checks which way the drive moves the star."
             elif phase.startswith("latency"):
-                name, description = "Drive response delay", "Same-direction speed changes estimate command latency separately from backlash."
+                name, description = "Drive response delay", "Same-direction speed changes measure how long the drive takes to react (this is not backlash)."
             elif phase.startswith("reverse"):
-                name, description = "Reverse drive", "Driving RA in reverse to measure the response after a direction change."
+                name, description = "Reverse drive", "Reversing RA direction: while the gears take up the slack the star lags. That lag is the backlash."
             elif phase.startswith("forward"):
-                name, description = "Forward drive", "Driving RA forward to measure the other reversal direction."
+                name, description = "Forward drive", "Driving forward again to measure the slack in the other direction."
             else:
                 name, description = phase.replace("_", " "), "Recording star motion."
-            self._phase_description = f"{name} — {description}"
+            step = self._phase_step(phase)
+            prefix = f"Step {step[0]} of {step[1]} · " if step else ""
+            self._phase_description = f"{prefix}{name} — {description}"
             self.state_label.setText(f"{name.upper()}  ·  {event['duration']:.1f} s")
             self._update_guidance(self._phase_description)
             self._log(f"Phase {event['phase']}: {event['duration']:.1f} s · raw rate {event['raw_rate']:+g}×")
+        elif kind == "map_point":
+            self._map_progress = f"Angle {event['index'] + 1} of {event['total']} ({event['angle']:+g}°)"
+            self._update_guidance()
         elif kind == "calibration":
             self.calibration = event
             self._update_trajectory()
             self._log(f"Drift {event['v0']:.3f} px/s · RA unit vector {event['u']} · driver sign {event['sign']:+g}")
         elif kind == "sample":
+            # Cheap append only; the simulator can emit hundreds per second.
             if self.last_result is None:
                 self.samples.append(tuple(finite(event.get(key)) for key in ("t", "x", "y")))
-                origin = self._update_trajectory()
-                if self._pending_phase and origin is not None and math.isfinite(finite(event.get("t"))):
-                    self._command_marker(event["t"] - origin[0])
+                if self._pending_phase and math.isfinite(finite(event.get("t"))):
+                    self._pending_markers.append(event["t"])
                     self._pending_phase = False
-                    self._update_trajectory()
+                self._request_trajectory()
+            return
         self._gate()
 
     @QtCore.Slot(object)
     def _on_frame(self, frame):
+        try:
+            self._show_frame(frame)
+        finally:
+            self.worker._frame_sent_at = 0.
+
+    def _show_frame(self, frame):
         image = frame.image
         self.image_item.setImage(image, autoLevels=False)
         # Robust display stretch is display-only, never applied to raw centroids.
@@ -1577,6 +1710,8 @@ class MainWindow(QtWidgets.QMainWindow):
         self.fit_items.clear()
         self._has_commands = self._has_fits = False
         self._pending_phase = False
+        self._pending_markers.clear()
+        self._trajectory_dirty = False
         self.bracket_item.setData([], [])
         origin = self._update_trajectory()
         calibrated = self._trajectory_calibration()
@@ -1620,8 +1755,8 @@ class MainWindow(QtWidgets.QMainWindow):
             self.trail_item.setData(positions[:, 0], positions[:, 1], connect="finite")
             self._fit_image()
         self._update_trajectory()
-        self._update_guidance("Result available — inspect Result & next action for interpretation and Trajectory for fits. "
-                              "Measure here is one point; Start map measures multiple angles.")
+        self._update_guidance("Result ready — read the coloured box at the top; 'Result details' explains it and 'Trajectory graph' shows the fits. "
+                              "'Measure at several angles' repeats the test across the axis.")
         for note in notes:
             self._log(note)
 

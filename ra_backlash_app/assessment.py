@@ -9,7 +9,7 @@ BINDING_WARNING = (
     "Do not tighten blindly; follow the mount manufacturer's mechanical procedure."
 )
 REPEAT_MAP = (
-    "Repeat at the same pose to check repeatability, then use Start map before considering "
+    "Repeat at the same pose to check repeatability, then use 'Measure at several angles' before considering "
     "mesh tuning. Inspect the sampled range and follow the manufacturer's procedure."
 )
 
@@ -133,11 +133,41 @@ def assess_result(result, target_arcsec=None):
                     meaning = "B ± U crosses the selected comparison goal; the diagnostic envelope cannot decide above versus within target."
             elif target_arcsec is not None:
                 title = "Measurable backlash — comparison goal invalid"
+    verdict, headline, summary = _verdict(status, b, u, target if target_valid else None)
     return dict(status=status, title=title, meaning=meaning, action=action, details=details,
                 binding_warning=BINDING_WARNING, tone=tone, backlash_arcsec=b,
                 uncertainty_arcsec=u, target_arcsec=target if target_valid else None,
+                verdict=verdict, headline=headline, summary=summary,
                 simulation=r.get("simulation") is True, qualified=usable and status in {
                     "measurable", "above_target", "within_target", "overlaps_target"})
+
+
+def _verdict(status, b, u, target):
+    """Plain-language headline for the always-visible result card."""
+    value = f"{b:.1f} ± {u:.1f} arcsec" if b is not None and u is not None else "unknown"
+    limit = f"{target:g} arcsec" if target is not None else ""
+    if status == "above_target":
+        return ("large", f"LARGE backlash: {value}, above your {limit} limit",
+                "If a repeat measurement agrees, the gear mesh may be too loose. Follow the mount manual's "
+                "adjustment procedure, then measure again. Do not adjust from one run.")
+    if status == "within_target":
+        return ("acceptable", f"ACCEPTABLE backlash: {value}, within your {limit} limit",
+                "No adjustment is needed for this limit. Optionally measure several angles to check the whole axis.")
+    if status == "overlaps_target":
+        return ("borderline", f"BORDERLINE: {value} straddles your {limit} limit",
+                "The measurement cannot say which side of your limit this is on. Repeat it to decide.")
+    if status == "measurable":
+        return ("measured", f"BACKLASH MEASURED: {value}",
+                "Turn on 'Compare with my acceptable limit' to see whether this is large or acceptable.")
+    if status == "unresolved":
+        return ("none_detected", f"NO BACKLASH DETECTED: smaller than the measurement noise (±{u:.1f} arcsec)",
+                "Either the backlash is very small, or the gears are tight/binding. This test cannot tell which. "
+                "Repeat once; if the mount also feels rough or stalls, inspect it mechanically.")
+    if status == "inconclusive":
+        return ("inconclusive", f"INCONCLUSIVE: about {value}, but not trustworthy",
+                "Repeat with a better isolated star, steadier seeing and no guiding. Do not adjust from this run.")
+    return ("unreliable", "MEASUREMENT UNRELIABLE: repeat it",
+            "This run failed or its quality was too low to give a backlash value. See the reasons below and try again.")
 
 
 def assess_map(rows):
@@ -179,6 +209,6 @@ def assess_map(rows):
         angles = lambda values: ", ".join(f"{a:+g}°" for a in values)
         meaning = f"Lowest measured gap candidate(s): {angles(low)}. Highest measured gap candidate(s): {angles(high)}. Neither is binding proof or a safe mesh setting."
     return dict(status=status, title=title, meaning=meaning, details=details,
-                action="Select a row → Result & next action to inspect its evidence. Repeat the same pose, then extend Start map before mesh tuning.",
+                action="Select a row → Result details to inspect its evidence. Repeat the same pose, then extend 'Measure at several angles' before mesh tuning.",
                 binding_warning=BINDING_WARNING, tone="neutral", qualified_angles=count,
                 excluded_count=excluded, lowest_angles=low, highest_angles=high)

@@ -692,6 +692,7 @@ def phase_event(window, name):
 
 def sample_event(window, t, x, y):
     window._on_event(dict(type="sample", t=t, x=x, y=y))
+    window._flush_trajectory()
 
 
 def completed_display_result():
@@ -715,8 +716,8 @@ def test_connected_guidance_is_persistent_without_launching_work(window, monkeyp
     window._on_ready("idle")
     assert not launches
     guidance = window.guidance_label.text()
-    for text in ("1 Full frame", "2 Auto-select or click an isolated star", "3 Measure here",
-                 "auto-selects if no choice", "one point", "multiple signed angles", "fast virtual time"):
+    for text in ("1 Take picture", "2 Pick a star", "3 Measure backlash",
+                 "tests one position", "auto-picks a star", "several angles", "fast virtual time"):
         assert text in guidance
     for button in (window.connect_button, window.preview_button, window.live_button,
                    window.auto_button, window.measure_button, window.map_button, window.plan_button):
@@ -724,15 +725,15 @@ def test_connected_guidance_is_persistent_without_launching_work(window, monkeyp
 
 
 @pytest.mark.parametrize("state,expected", [
-    ("preview", "Preview exposure"), ("acquiring", "reacquiring"),
-    ("awaiting_star", "Skip field"), ("completed", "diagnostic allowance"),
-    ("fault", "disconnect"), ("adjustment", "Clear hands/tools"),
-    ("disconnected", "no exposures"), ("stopping", "cooperative cleanup"),
+    ("preview", "Picture shown"), ("acquiring", "Locating the star"),
+    ("awaiting_star", "Skip this position"), ("completed", "coloured result box"),
+    ("fault", "disconnect"), ("adjustment", "Clear hands and tools"),
+    ("disconnected", "Simulation to practice"), ("stopping", "cooperative stop"),
 ])
 def test_guidance_states(window, state, expected):
     window._on_ready(state)
     assert expected in window.guidance_label.text()
-    assert "1 Full frame" in window.guidance_label.text()
+    assert "1 Take picture" in window.guidance_label.text()
 
 
 @pytest.mark.parametrize("phase,expected", [
@@ -872,7 +873,7 @@ def test_completed_image_uses_full_recorded_path_and_refits(window, monkeypatch)
     np.testing.assert_allclose(x, recorded[:, 1])
     np.testing.assert_allclose(y, recorded[:, 2])
     assert fitted == [True]
-    assert window.time_plot.minimumHeight() >= 220
+    assert window.time_plot.minimumHeight() >= 130
     assert window.time_plot.plotItem.legend.columnCount == 2
 
 
@@ -909,8 +910,8 @@ def test_partial_results_never_crash_or_invent_fits(window, frames, u, v0):
 
 
 def test_map_direction_names_captions_and_scatter_only(window):
-    assert "Run Start map" in window.map_caption.text()
-    assert "Measure here produces one point, no full map" in window.map_caption.text()
+    assert "Run 'Measure at several angles'" in window.map_caption.text()
+    assert "'Measure backlash' gives one position, not a full map" in window.map_caption.text()
     rows = [dict(angle=25., backlash=12., fwd_rev=11., rev_fwd=13., uncertainty_arcsec=1.)]
     window.baseline = [dict(rows[0], angle=-25.)]
     for _ in range(3):
@@ -952,7 +953,7 @@ def test_real_simulator_signals_complete_then_preview_without_reverting(window, 
         assert window._launch("connect", cfg=cfg, simulation=True)
         until(app, lambda: len(ready) == 1)
         assert not frames and not results  # Connecting itself never exposes.
-        assert "1 Full frame" in window.guidance_label.text()
+        assert "1 Take picture" in window.guidance_label.text()
         assert window._launch("measure", cfg=cfg)
         until(app, lambda: len(ready) == 2, 60)
         assert ready[-1] == "completed"
@@ -976,14 +977,19 @@ def test_real_simulator_signals_complete_then_preview_without_reverting(window, 
 
 def test_result_tab_is_first_readable_and_does_not_replace_trajectory(window):
     assert window.tabs.widget(0) is window.assessment_panel
-    assert window.tabs.tabText(0) == "Result & next action"
+    assert window.tabs.tabText(0) == "Result details"
     assert window.assessment_details.isReadOnly()
     assert window.assessment_panel.widgetResizable()
-    assert not window.target_check.isChecked()
+    assert window.target_check.isChecked() and window.target_spin.value() == 10.
+    assert window.target_spin.isEnabled()
+    assert window.verdict_headline.text() == "No measurement yet"
+    window.target_check.setChecked(False)
     assert not window.target_spin.isEnabled()
     window._on_result(dict(completed_display_result(), quality="valid"))
     assert window.assessment_title.text() == "Measurable backlash — size target not set"
-    assert "Start map" in window.assessment_action.text()
+    assert window.verdict_card.property("verdict") == "measured"
+    assert "12.0 ± 1.5 arcsec" in window.verdict_headline.text()
+    assert "several angles" in window.assessment_action.text()
     assert "cannot detect binding" in window.assessment_warning.text()
     assert "12.000 ± 1.500" in window.result_summary.text()
     assert window.fit_items  # Existing trajectory remains intact.
@@ -993,6 +999,7 @@ def test_comparison_goal_is_display_only_reassesses_without_rerun(window, monkey
     calls = []
     monkeypatch.setattr(window.worker, "submit", lambda *a, **k: calls.append((a, k)))
     r = dict(completed_display_result(), quality="valid")
+    window.target_check.setChecked(False)
     window._on_result(r)
     old_config = window._config()
     old_fits = list(window.fit_items)
@@ -1001,26 +1008,40 @@ def test_comparison_goal_is_display_only_reassesses_without_rerun(window, monkey
     window.target_check.setChecked(True)
     assert window.target_spin.isEnabled()
     assert "Within selected target" in window.assessment_title.text()
+    assert window.verdict_card.property("verdict") == "acceptable"
+    assert "ACCEPTABLE" in window.verdict_headline.text()
     window.target_spin.setValue(5.)
     assert "Above selected target" in window.assessment_title.text()
+    assert window.verdict_card.property("verdict") == "large"
+    assert "LARGE" in window.verdict_headline.text()
     window.target_spin.setValue(12.)
     assert "overlaps target" in window.assessment_title.text()
+    assert "BORDERLINE" in window.verdict_headline.text()
     window.target_check.setChecked(False)
     assert "size target not set" in window.assessment_title.text()
     assert not calls and window._config() == old_config
     assert window.last_result is r and window.fit_items == old_fits
-    assert not any("target" in key for key in window.settings.allKeys())
 
 
-def test_goals_stay_only_in_this_window(window, app):
+def test_acceptable_limit_is_remembered_but_defaults_on(window, app):
+    assert window.target_check.isChecked() and window.target_spin.value() == 10.
     window.target_spin.setValue(20.)
-    window.target_check.setChecked(True)
+    window.target_check.setChecked(False)
     other = MainWindow(start_worker=False, settings=window.settings)
     try:
         assert not other.target_check.isChecked()
+        assert other.target_spin.value() == 20.
         assert not other.target_spin.isEnabled()
     finally:
         other.close()
+
+
+def test_none_detected_verdict_never_claims_zero_or_binding(window):
+    window._on_result(dict(completed_display_result(), quality="valid", backlash=1., uncertainty_arcsec=3.))
+    assert window.verdict_card.property("verdict") == "none_detected"
+    assert "NO BACKLASH DETECTED" in window.verdict_headline.text()
+    assert "tight/binding" in window.verdict_detail.text()
+    assert "cannot tell which" in window.verdict_detail.text()
 
 
 def test_actual_drift_clears_interpretation_and_target_changes_do_not_revive_it(window):
@@ -1095,6 +1116,7 @@ def test_import_interprets_row_zero_offline_not_current_simulator(window, tmp_pa
     path = tmp_path / "saved.json"
     path.write_text(json.dumps(r), encoding="utf-8")
     monkeypatch.setattr(QtWidgets.QFileDialog, "getOpenFileName", lambda *a, **k: (str(path), ""))
+    window.target_check.setChecked(False)
     window.connected = window.simulation = True
     window._import(False)
     assert window.table.currentRow() == 0
@@ -1129,3 +1151,64 @@ def test_live_connection_context_only_and_map_summary_does_not_overrule_point(wi
     assert "Inconclusive" in window.assessment_title.text()
     window._on_result(dict(completed_display_result(), connection="old"))
     assert "source not recorded" in window.assessment_details.toPlainText()
+
+def test_sample_flood_is_coalesced_and_loses_nothing(window, monkeypatch):
+    draws = []
+    original = window._update_trajectory
+    monkeypatch.setattr(window, "_update_trajectory", lambda: draws.append(1) or original())
+    phase_event(window, "drift")
+    for i in range(3000):
+        window._on_event(dict(type="sample", t=float(i), x=100. + i * .01, y=200.))
+    assert len(window.samples) == 3000
+    assert len(draws) <= 5
+    window._flush_trajectory()
+    assert len(window.x_curve.getData()[0]) == 3000
+    assert len(window._pending_markers) == 0
+
+
+def test_frame_backpressure_drops_frames_until_gui_consumes(app):
+    worker = DeviceWorker()
+    frames = []
+    worker.frame.connect(frames.append)
+    frame = dict(image=np.ones((8, 8), dtype=np.float32), origin=(0, 0), t=1.)
+    worker._publish_frame(frame)
+    worker._last_frame = 0.
+    worker._publish_frame(frame)
+    assert worker._frame_sent_at > 0
+    app.processEvents()
+    assert len(frames) == 1
+    worker._frame_sent_at = 0.
+    worker._publish_frame(frame)
+    app.processEvents()
+    assert len(frames) == 2
+    worker._last_frame = 0.
+    worker._publish_frame(frame, force=True)
+    app.processEvents()
+    assert len(frames) == 3
+
+
+def test_phase_step_numbers_and_map_progress_in_guidance(window):
+    window.fields["cycles"].setValue(3)
+    assert window._phase_step("drift") == (1, 11)
+    assert window._phase_step("latency_slow") == (5, 11)
+    assert window._phase_step("reverse_1") == (6, 11)
+    assert window._phase_step("forward_3") == (11, 11)
+    assert window._phase_step("forward_4") is None
+    phase_event(window, "reverse_2")
+    assert "Step 8 of 11" in window.guidance_label.text()
+    window._on_event(dict(type="map_point", index=1, total=6, angle=-50.))
+    assert "Angle 2 of 6 (-50\u00b0)" in window.guidance_label.text()
+    window._on_ready("completed")
+    assert "Angle 2 of 6" not in window.guidance_label.text()
+
+
+def test_confirmation_dialogs_explain_duration_and_map_star_choice(window, monkeypatch):
+    seen = []
+    monkeypatch.setattr(QtWidgets.QMessageBox, "question", staticmethod(lambda *a, **k: seen.append(a[2]) or QtWidgets.QMessageBox.StandardButton.No))
+    monkeypatch.setattr(window.worker, "submit", lambda *a, **k: pytest.fail("must not launch"))
+    window._measure()
+    assert "minute" in seen[0] and "back and forth" in seen[0]
+    window.simulation = True
+    window.geometry_check.setChecked(True)
+    window._plan_or_map(True)
+    assert "picks its own star" in seen[1] or "picks its own star" in seen[0]

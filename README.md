@@ -34,13 +34,13 @@ There is no standalone executable/installer yet. The initial window is **disconn
 
 ## Try the desktop simulator first
 
-1. Select **Connect devices…**, leave **Simulation — no hardware** checked, and connect.
-2. Use **Full frame** or **Live preview**, then **Auto-select / retry** or click an isolated star in the main image. Stop live preview before starting a measurement.
-3. Use **Measure here** and accept the explicit motion confirmation. Each run reacquires the selected identity and recalibrates. Inspect quality, direction-separated results, latency, cadence, residual noise and diagnostic allowance.
-4. Preview the map before **Start map…**. Defaults request six points: **−75, −50, −25, +25, +50, +75°**, three per signed group, first magnitude/spacing 25°, minimum altitude **25°**. Center is off; zero requires an explicit HA branch and is currently refused. Custom ordered nonzero angles within ±82° are supported.
-5. Inspect all requested rows, changed feasible declinations and skipped reasons. Signed groups are **not actual pier sides**. A failed acquisition can be retried manually/automatically at that field or skipped; selected-star loss during measurement stops the run, rather than silently switching identities.
+1. Select **Connect camera & mount… (or Simulation)**, leave **Simulation — no hardware** checked, and connect. Nothing moves and no picture is taken yet.
+2. Click **1 · Take picture** (or **Live view**) to see the stars. Then click **2 · Pick star automatically** or click an isolated star in the camera picture. Stop Live view before measuring.
+3. Click **3 · Measure backlash** and accept the confirmation (it states how long the run takes; about a minute and a half per angle on a real mount, seconds in the simulator). Each run re-finds the star and recalibrates. The coloured **result box** near the top then shows the value and a verdict.
+4. Optionally use **Check which angles are reachable**, then **Measure at several angles…** to repeat the measurement across the axis. Defaults are six angles: **−75, −50, −25, +25, +50, +75°**, minimum altitude **25°**. Center is off; zero requires an explicit HA branch and is currently refused. Custom ordered nonzero angles within ±82° are supported. This mode picks its **own star at each angle**; the star you clicked is used only by **Measure backlash**.
+5. Inspect all requested rows, changed feasible declinations and skipped reasons. The signed angles are **not actual pier sides**. A failed acquisition can be retried at that angle or skipped (**Skip this position**); losing the selected star during measurement stops the run, rather than silently switching stars.
 
-The **Next** panel keeps these steps visible and explains the current phase. Simulation uses accelerated virtual time, so calibration/reversal phases can pass quickly. **Measure here** makes one measurement at the current position; **Start map** performs measurements at multiple angles. No image acquisition or motion starts merely by connecting.
+The **Next** panel keeps these steps visible, shows "Step n of N" during a measurement and "Angle k of M" during a multi-angle run. Simulation uses accelerated virtual time, so phases can pass quickly. No image acquisition or motion starts merely by connecting.
 
 ### Read the displays
 
@@ -68,25 +68,26 @@ The simulator shares the desktop controller and view path. It supports seeded kn
 
 A map minimum is only a **measured candidate**, not evidence of binding, a universal zero-backlash target, or full RA-wheel coverage. Only completed quality-valid points qualify; overlapping diagnostic allowances are reported as tied/uncertain candidates. Imported results cannot authorize return motion.
 
-Select a live qualified table row from the current connection and use **Return to selected candidate…**. Explicit confirmation authorizes a slew, fresh star acquisition/calibration and a **confirmation measurement**. A valid saved confirmation is required. Because measurement itself moves RA, a **second slew** recomputes the target from current LST and returns to the requested angle before stopping RA and turning tracking off. Requested versus achieved HA-derived pose/pier/altitude is verified; ambiguous or failed checks refuse adjustment, not silently claim physical positioning.
+Select a live qualified table row from the current connection and use **Go back to selected angle to adjust…**. Explicit confirmation authorizes a slew, fresh star acquisition/calibration and a **confirmation measurement**. A valid saved confirmation is required. Because measurement itself moves RA, a **second slew** recomputes the target from current LST and returns to the requested angle before stopping RA and turning tracking off. Requested versus achieved HA-derived pose/pier/altitude is verified; ambiguous or failed checks refuse adjustment, not silently claim physical positioning.
 
-In **adjustment**, automatic measurement/preview/map motion is interlocked and tracking remains off. The star drifts away; motors can remain energized. There is no automatic mesh adjustment or detection of hands, tools or binding. Follow the mount manufacturer's mechanical procedure. **Finish adjustment / enable tracking…** requires explicit hands/tools-clear confirmation, enables tracking without an automatic slew, and requires reacquisition/calibration for remeasurement.
+In **adjustment**, automatic measurement/preview/map motion is interlocked and tracking remains off. The star drifts away; motors can remain energized. There is no automatic mesh adjustment or detection of hands, tools or binding. Follow the mount manufacturer's mechanical procedure. **Done adjusting — resume tracking…** requires explicit hands/tools-clear confirmation, enables tracking without an automatic slew, and requires reacquisition/calibration for remeasurement.
 
 ## Interpret results
 
-After **Measure here**, open **Result & next action** (it opens automatically on completion). It explains the measurement and recommends a next step, independently of the plots:
+After **3 · Measure backlash**, the coloured **result box** below the "Next" panel shows the value and a plain verdict. **Result details** (first tab) holds the full explanation, diagnostics and caveats.
 
-| Assessment | Meaning / next step |
+| Verdict (colour) | Meaning / next step |
 | --- | --- |
-| **Measurable backlash — size target not set** | Positive lost motion is resolved above the diagnostic allowance. Repeat at the same pose, then map several angles before considering mesh tuning. It is not automatically “too loose.” |
-| **Not resolved above measurement uncertainty** | The estimate is no greater than its diagnostic allowance. This is **not a measured zero**, and does not prove binding. Improve measurement conditions and repeat; do not keep tightening to chase zero. |
-| **Inconclusive / measurement unreliable** | Noise, correlation, missing calibration, loss, interrupted acquisition or other quality failures prevent a size/mesh conclusion. Address the quality reasons first. |
-| **Above / within selected target** | Optional comparison against **your** maximum acceptable RA-axis backlash, not a manufacturer tolerance or safe physical mesh gap. Only qualified measurements are compared, and the complete diagnostic envelope must be on the relevant side. |
-| **Diagnostic envelope overlaps target** | The evidence cannot distinguish above versus within your goal; repeat rather than assuming a pass/fail. |
+| **ACCEPTABLE** (green) | The whole diagnostic envelope is within *your* acceptable limit. No adjustment is needed for that limit; optionally check several angles. |
+| **LARGE** (red) | The whole envelope is above your limit. Repeat once; if it agrees, follow the mount manual's adjustment procedure, then measure again. Never adjust from a single run. |
+| **BORDERLINE** (amber) | The envelope straddles your limit; repeat to decide. |
+| **BACKLASH MEASURED** (blue) | A resolved value, shown only when the limit comparison is switched off. |
+| **NO BACKLASH DETECTED** (amber) | The estimate is no larger than the measurement noise. That means *very small* **or** *tight/binding*; this test cannot tell which. It is **not a measured zero**. Repeat once; if the mount feels rough or stalls, inspect it mechanically. |
+| **INCONCLUSIVE / UNRELIABLE** (amber / grey) | Noise, correlation, a failed run or other quality problems prevent a size conclusion. Fix the cause (better isolated star, steadier seeing, no guiding) and repeat. |
 
-The optional target is disabled by default, applies only to interpretation, stays local to the current window and is not saved with measurements. Enabling or changing it does not change the estimator, start a measurement, authorize motion or establish a safe adjustment. No universal EQ6-R backlash limit is assumed.
+The **acceptable limit** is on by default at a **starting guess of 10 RA-axis arcsec**. This is *not* a manufacturer specification and the app does not know your guiding error; set a value that suits your setup (backlash matters when it is larger than your typical guiding error or seeing). The limit is remembered on this computer, only changes the *wording* of the result, is not stored in measurement files, and never reruns a measurement, authorizes motion, or changes the estimator. You can switch the comparison off.
 
-For example, **13.3 ± 3.3 RA-axis arcsec** represents an inferred gap with a diagnostic envelope of approximately **10.0–16.6 arcsec** (not a calibrated confidence interval). With a valid run it is measurable; a selected target of 5 arcsec would be below the whole envelope, 20 arcsec above it, and 12 arcsec inside it. These are comparison examples, **not recommended settings**. At a 2× sidereal measurement rate, the nominal reversal take-up model gives about **0.44 s**, excluding command latency; this is not a prediction of guiding performance.
+For example, **13.3 ± 3.3 RA-axis arcsec** represents an inferred gap with a diagnostic envelope of approximately **10.0–16.6 arcsec** (not a calibrated confidence interval). A limit of 5 arcsec would be below the whole envelope (LARGE), 20 arcsec above it (ACCEPTABLE), and 12 arcsec inside it (BORDERLINE). These are comparison examples, **not recommended settings**.
 
 Select any measured/imported table row to read its assessment. The map summary compares qualified sampled angles, flags overlapping envelopes and excludes unqualified rows. One point cannot establish the axis's tightest location. Simulation results are educational synthetic data, not evidence about the real mount.
 
